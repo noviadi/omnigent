@@ -44,13 +44,19 @@ import {
   Select,
   SelectContent,
   SelectItem,
-  SelectSeparator,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import {
+  ConfigRow,
+  DescribedSelect,
+  EFFORT_SELECT_NONE,
+  MODEL_SELECT_DEFAULT,
+  MODEL_SELECT_SMART,
+} from "@/components/HarnessConfigControls";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -184,16 +190,6 @@ const SKILL_PILL_AGENTS = new Set(["polly", "debby"]);
 // sessions only. "default" is Claude's own default and sends no flag; any
 // other value is passed through as `--permission-mode <value>` via the
 // session's terminal_launch_args. Keep in sync with `claude --help`.
-// Harnesses for which server-side smart routing is available.
-const _ROUTABLE_HARNESSES = new Set([
-  "claude-sdk",
-  "claude_sdk",
-  "claude-native",
-  "codex",
-  "codex-native",
-  "pi",
-]);
-
 const CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE = "default";
 const CLAUDE_NATIVE_PERMISSION_MODES: { value: string; label: string; description: string }[] = [
   { value: "default", label: "Default", description: "Prompts before edits and commands" },
@@ -1307,115 +1303,6 @@ function AgentHarnessPicker({
   );
 }
 
-// Sentinel Select values for the Model row. Radix requires a non-empty value,
-// so the two "no explicit model" choices ride on reserved tokens rather than
-// "": DEFAULT = Claude Code's own configured model (no override), SMART = the
-// intelligent router picks per turn.
-const MODEL_SELECT_DEFAULT = "__default__";
-const MODEL_SELECT_SMART = "__smart__";
-// Sentinel for the "no explicit effort" (—) choice, same reasoning.
-const EFFORT_SELECT_NONE = "__none__";
-
-/**
- * A labeled configuration row: bold label + muted sub-description on the left,
- * the control on the right. Mirrors the "Configure …" modal layout.
- */
-function ConfigRow({
-  label,
-  description,
-  children,
-}: {
-  label: string;
-  description?: string;
-  children: ReactNode;
-}) {
-  return (
-    // Stacked on mobile (label above a full-width control) so the label never
-    // gets squeezed into a narrow column and wraps hard; side-by-side from sm+
-    // with the control pinned to a fixed width.
-    <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
-      <div className="min-w-0 sm:pt-1">
-        <div className="text-sm font-medium">{label}</div>
-        {description && <div className="text-xs text-muted-foreground">{description}</div>}
-      </div>
-      <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
-    </div>
-  );
-}
-
-/**
- * A config-modal Select whose options carry descriptions. The description of
- * the hovered / focused option (falling back to the selected one) shows in a
- * footer line pinned at the bottom of the OPEN dropdown. The popup is pinned to
- * the trigger width and the footer wraps, so the dropdown never changes width
- * as you hover across options.
- *
- * @param value Selected option value.
- * @param onValueChange Selection callback.
- * @param options Value/label/description triples.
- * @param testId Trigger test id.
- * @param ariaLabel Accessible name for the trigger (the visible ConfigRow
- *   label is visual-only, so pass it here to name the control for AT).
- */
-function DescribedSelect({
-  value,
-  onValueChange,
-  options,
-  testId,
-  ariaLabel,
-}: {
-  value: string;
-  onValueChange: (value: string) => void;
-  options: readonly { value: string; label: string; description: string }[];
-  testId: string;
-  ariaLabel: string;
-}) {
-  const [previewed, setPreviewed] = useState<string | null>(null);
-  const detail = options.find((o) => o.value === (previewed ?? value))?.description;
-  return (
-    <Select
-      value={value}
-      onValueChange={onValueChange}
-      // Reset the preview when the list closes so the next open starts on the
-      // selected option's blurb.
-      onOpenChange={(next) => {
-        if (!next) setPreviewed(null);
-      }}
-    >
-      <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
-        <SelectValue />
-      </SelectTrigger>
-      {/* Pin the popup to the trigger width so a long blurb wraps in the footer
-      instead of widening the list as you hover across options. */}
-      <SelectContent
-        position="popper"
-        align="start"
-        className="w-(--radix-select-trigger-width) [&_[data-slot=select-item]]:pl-2.5"
-      >
-        {options.map((o) => (
-          <SelectItem
-            key={o.value}
-            value={o.value}
-            onPointerEnter={() => setPreviewed(o.value)}
-            onFocus={() => setPreviewed(o.value)}
-          >
-            {o.label}
-          </SelectItem>
-        ))}
-        {/* Footer blurb pinned inside the dropdown, tracking the hovered row.
-        min-h reserves a line so the popup height doesn't jump as it changes. */}
-        <SelectSeparator />
-        <p
-          data-testid={`${testId}-detail`}
-          className="min-h-8 px-2.5 pt-0.5 pb-1 text-xs leading-snug text-muted-foreground"
-        >
-          {detail}
-        </p>
-      </SelectContent>
-    </Select>
-  );
-}
-
 /**
  * Harness-configuration modal opened from the composer's gear icon. Shows the
  * selected agent's run-config knobs — Claude: model / effort / permissions;
@@ -2357,13 +2244,9 @@ export function NewChatLandingScreen() {
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
-  // Smart routing is offered in the config modal — as a Model choice for Claude,
-  // a standalone toggle otherwise — when the server enables it and the selected
-  // harness is routable. Use the EFFECTIVE harness (a bundle agent's brain-
-  // harness override wins over its spec harness), so overriding Polly/Debby to a
-  // non-routable harness (e.g. Cursor) correctly drops routing eligibility.
-  const effectiveHarness = pickedHarness ?? selectedAgent?.harness ?? "";
-  const smartRoutingEligible = smartRoutingEnabled && _ROUTABLE_HARNESSES.has(effectiveHarness);
+  // Smart Routing (per-session model selection) is superseded by the Auto
+  // harness which handles both harness + model. Hide it entirely for now.
+  const smartRoutingEligible = false;
   // Whether the gear config modal has anything to show for the selected agent
   // (drives the gear icon's visibility). Bundle agents with an overridable
   // brain harness qualify, as does any routing-eligible agent — Smart Routing
@@ -3090,13 +2973,17 @@ export function NewChatLandingScreen() {
             model_override: agentSupportsPermissionMode && pickedModel ? pickedModel : undefined,
             reasoning_effort:
               agentSupportsPermissionMode && pickedEffort ? pickedEffort : undefined,
-            // Smart routing toggle — server-side. Only send it when routing is
-            // actually eligible for the effective harness, so a stale "on" (from
-            // a since-overridden harness, or the server flag flipping off) can't
-            // ride along invisibly with no control to clear it.
-            cost_control_mode_override: smartRoutingEligible
-              ? (costControlMode ?? undefined)
-              : undefined,
+            // Smart routing toggle — server-side. The "Auto" harness always
+            // routes (harness + model), so send "on" to keep the persisted
+            // state consistent with the lit routing icon. Otherwise only send
+            // it when routing is eligible for the effective harness, so a stale
+            // "on" can't ride along invisibly with no control to clear it.
+            cost_control_mode_override:
+              pickedHarness === AUTO_HARNESS_ID
+                ? "on"
+                : smartRoutingEligible
+                  ? (costControlMode ?? undefined)
+                  : undefined,
             harness_override: pickedHarness ?? undefined,
           }),
         });
