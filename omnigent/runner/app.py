@@ -2225,6 +2225,23 @@ async def _auto_create_amp_terminal(
     token = token_factory() if token_factory else None
     bridge = prepare_bridge_dir(session_id)
     clear_inbox(bridge)
+    # Reconcile delivery state left mid-flight by a prior process. A record in
+    # pending/submission_started has no proven outcome (Amp may have committed
+    # the prompt), so it must NEVER be blindly replayed: it becomes
+    # recovery_required and surfaces a typed event so a human/explicit path
+    # decides. Survives recreate because records live under delivery/, not
+    # inbox/ (which clear_inbox just emptied).
+    from omnigent.amp_native_delivery import DeliveryJournal
+
+    for recovered in DeliveryJournal(bridge).reconcile_on_start():
+        publish_event(
+            session_id,
+            {
+                "type": "amp_native_delivery_recovery",
+                "delivery_id": recovered.delivery_id,
+                "reason": recovered.reason,
+            },
+        )
     _plugin, config = install_plugin_and_config(
         bridge,
         session_id=session_id,
