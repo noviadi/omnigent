@@ -1,0 +1,791 @@
+"""Durable, versioned prompt-delivery journal for ``amp-native``.
+
+A browser prompt reaches the resident Amp TUI through tmux paste + Enter
+(:func:`omnigent.amp_native_bridge.inject_user_message`). Tmux injection is
+not transactional: a crash or runner restart between the paste and Amp's
+plugin confirmation leaves an ambiguous outcome. Amp may have already
+committed the prompt (or executed tools) even though the local process
+reported nothing. Blindly replaying the prompt on retry can therefore
+submit the same browser work twice.
+
+This module closes that gap with a per-bridge delivery journal. The bridge
+writes a versioned record for every browser prompt and advances its state
+machine atomically (temp-file + ``os.replace`` + ``fsync`` of file AND
+directory) so a restart can reconcile each record deterministically::
+
+    pending
+       │ mark_submission_started (durable BEFORE paste)
+       ▼
+    submission_started
+       │ plugin confirmation (correlated by the matching thread + response_id)
+       ▼
+    confirmed
+
+A failure AFTER the first mutating tmux operation is treated as ambiguous
+(Amp may have received the prompt), so it becomes ``recovery_required`` —
+never ``failed``. Only a pre-paste failure (no byte could have reached Amp)
+may become ``failed``. A record left non-terminal across a restart is NEVER
+automatically resubmitted: :func:`DeliveryJournal.reconcile_on_start`
+transitions it to ``recovery_required`` so the harness surfaces an
+actionable, typed result instead of silently re-injecting the prompt.
+
+Concurrency: every transition is a compare-and-swap guarded by a per-record
+``fcntl`` lock, and only monotonic state transitions are accepted (a
+``confirmed`` record can never be regressed to ``recovery_required`` by a
+late reconcile). Durability is fail-closed: if the file or directory
+``fsync`` cannot be established, the write raises and injection does not
+proceed to paste.
+
+Records live under ``<bridge_dir>/delivery/<delivery_id>.json`` — outside
+``inbox/`` — so :func:`omnigent.amp_native_bridge.clear_inbox` (called on
+terminal recreation) cannot wipe delivery state.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import enum
+import fcntl
+import hashlib
+import json
+import os
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any
+
+SCHEMA_VERSION = 1
+# Schema versions the loader can interpret safely. A record written by a
+# newer/unknown version is rejected on load (raises JournalCorruptError) rather
+# than read with the current shape, which could misinterpret fields and corrupt
+# the monotonic state machine on the next write.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({SCHEMA_VERSION})
+_DELIVERY_DIR = "delivery"
+_REASON_MAX = 200
+
+
+class DeliveryState(str, enum.Enum):
+    """Lifecycle of one browser prompt's delivery into Amp."""
+
+    PENDING = "pending"
+    SUBMISSION_STARTED = "submission_started"
+    CONFIRMED = "confirmed"
+    RECOVERY_REQUIRED = "recovery_required"
+    FAILED = "failed"
+
+
+# States with no proven terminal outcome; a restart must never replay them.
+_NON_TERMINAL_STATES = frozenset({DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED})
+
+# States for which a same-prompt retry must be blocked: no proven outcome
+# (pending/submission_started — paste may have happened) OR already flagged as
+# needing recovery. Only confirmed/failed have a proven outcome and may allow a
+# new delivery for the same prompt.
+_RETRY_BLOCKING_STATES = frozenset(
+    {DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED, DeliveryState.RECOVERY_REQUIRED}
+)
+
+
+# Monotonic transition table: the set of source states from which each target
+# is reachable. Anything not listed is rejected as a regression. ``confirm`` is
+# allowed from a recovery state so a late plugin confirmation can resolve an
+# uncertainty that a restart reconcile had already flagged.
+_ALLOWED_SOURCES: dict[DeliveryState, frozenset[DeliveryState]] = {
+    DeliveryState.SUBMISSION_STARTED: frozenset({DeliveryState.PENDING}),
+    DeliveryState.CONFIRMED: frozenset(
+        {DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED, DeliveryState.RECOVERY_REQUIRED}
+    ),
+    DeliveryState.RECOVERY_REQUIRED: frozenset(
+        {DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED}
+    ),
+    # Only a pre-paste failure (no byte reached Amp) may become failed.
+    DeliveryState.FAILED: frozenset({DeliveryState.PENDING}),
+    DeliveryState.PENDING: frozenset(),
+}
+
+
+@dataclass
+class DeliveryRecord:
+    """One persisted prompt-delivery journal entry (schema v1)."""
+
+    schema_version: int
+    delivery_id: str
+    conversation_id: str | None
+    response_id: str | None
+    normalized_content_hash: str
+    state: str
+    created_at: float
+    updated_at: float
+    attempts: int = 0
+    # Sanitized reason captured on the last transition into recovery/failed.
+    reason: str | None = None
+    # Durable Omnigent conversation item id stamped at confirmation, so a
+    # duplicate plugin post can return the existing item without re-appending.
+    confirmed_item_id: str | None = field(default=None, repr=False)
+
+    def state_enum(self) -> DeliveryState:
+        return DeliveryState(self.state)
+
+
+def _clock() -> float:
+    """Indirection point so tests can advance the clock deterministically."""
+    return time.time()
+
+
+def canonical_prompt(content: str) -> str:
+    """Normalize prompt text the same way injection delivers it.
+
+    Injection converts CRLF/CR to ``\\n``, keeps ``\\t`` and printable chars,
+    and drops every other control byte. The delivery hash must use the SAME
+    canonical form so two calls with paste-equivalent prompts share a digest
+    (a hash collision then means the prompts are genuinely the same delivery).
+    """
+    text = content.replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    for character in text:
+        if character == "\n" or character == "\t" or ord(character) >= 0x20:
+            out.append(character)
+    return "".join(out)
+
+
+def normalized_content_hash(content: str) -> str:
+    """Hash the paste-canonical prompt text (no raw prompt is stored).
+
+    A prompt may carry secrets, and durability is about delivery outcome, not
+    transcript replay — so only a digest is persisted.
+    """
+    return hashlib.sha256(canonical_prompt(content).encode("utf-8")).hexdigest()
+
+
+def sanitize_reason(text: str | None) -> str | None:
+    """Bound and de-control a free-form reason before it is persisted.
+
+    Exception text and tmux diagnostics can echo pane content or secrets; keep
+    the surfaced reason short, printable, and free of control bytes.
+    """
+    if not text:
+        return None
+    cleaned = "".join(ch if (ch == " " or ord(ch) >= 0x20) else " " for ch in str(text))
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:_REASON_MAX] or None
+
+
+class DurabilityError(RuntimeError):
+    """Raised when an fsync cannot establish on-disk durability (fail closed).
+
+    A subclass of :class:`RuntimeError` so it carries a clear, typed identity
+    the executor can distinguish from a post-mutation ``RuntimeError``: a
+    durability failure happens before any byte can reach Amp (the durable write
+    did not complete), so the delivery may safely become ``failed`` rather than
+    the ambiguous ``recovery_required``.
+    """
+
+
+class JournalCorruptError(RuntimeError):
+    """Raised when a journal record cannot be safely interpreted.
+
+    An unknown schema version or a malformed record is NOT the same as an
+    absent record: the loader cannot tell whether such an entry represents an
+    in-flight delivery, so it must be surfaced (never silently dropped) and the
+    harness must refuse to inject until it is reconciled, otherwise a corrupt
+    record hides a prior delivery and a new paste replays it.
+    """
+
+
+@dataclass(frozen=True)
+class ConfirmationOutcome:
+    """Result of correlating a plugin mirror with an outstanding delivery."""
+
+    confirmed: bool
+    delivery_id: str | None
+    already_confirmed: bool
+
+
+class DeliveryJournal:
+    """File-backed, versioned prompt-delivery journal for one bridge.
+
+    Each record is one JSON file written via temp-file + ``os.replace`` +
+    ``fsync`` (file and directory), so a crash mid-write cannot leave a
+    partially persisted state transition. Every transition is a per-record
+    compare-and-swap under a ``fcntl`` lock and only monotonic transitions are
+    accepted.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._dir = bridge_dir / _DELIVERY_DIR
+        # Populated by the most recent load_all(); prefer unreadable_records()
+        # for a fresh scan. Tracks corrupt/unsupported entries so they are
+        # never silently treated as absent (see JournalCorruptError).
+        self._unreadable: list[str] = []
+        # Records whose recovery transition could not be durably written at
+        # startup (a DurabilityError during reconcile_on_start). Non-empty means
+        # startup could not establish clean state; the harness must refuse new
+        # injection (fail closed) rather than risk replaying an uncertain record.
+        self._reconcile_failures: list[str] = []
+
+    @property
+    def root(self) -> Path:
+        return self._dir
+
+    def _ensure_dir(self) -> None:
+        self._dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self._dir, 0o700)
+
+    def _path(self, delivery_id: str) -> Path:
+        return self._dir / f"{delivery_id}.json"
+
+    def _lock_path(self, delivery_id: str) -> Path:
+        return self._dir / f".{delivery_id}.lock"
+
+    @contextmanager
+    def _record_lock(self, delivery_id: str):
+        """Exclusive cross-process lock serializing one record's transitions."""
+        self._ensure_dir()
+        lock_path = self._lock_path(delivery_id)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _fsync_dir(self) -> None:
+        """fsync the directory so a rename is durable — fail closed on error."""
+        dir_fd = os.open(self._dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        except OSError as exc:
+            raise DurabilityError(f"directory fsync failed: {exc}") from exc
+        finally:
+            os.close(dir_fd)
+
+    @staticmethod
+    def _fsync_file(handle) -> None:
+        """fsync an open file handle — fail closed with a typed error."""
+        try:
+            os.fsync(handle.fileno())
+        except OSError as exc:
+            raise DurabilityError(f"file fsync failed: {exc}") from exc
+
+    def _write_atomic(self, record: DeliveryRecord) -> None:
+        """Persist a record with temp-file + ``os.replace`` + fail-closed fsync."""
+        self._ensure_dir()
+        payload = json.dumps(asdict(record), sort_keys=True)
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{record.delivery_id}.", suffix=".tmp", dir=self._dir
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                self._fsync_file(handle)
+            os.replace(temporary, self._path(record.delivery_id))
+            temporary = None  # rename consumed the temp file
+            self._fsync_dir()
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                with contextlib_suppress_oserror():
+                    os.unlink(temporary)
+
+    def create(
+        self,
+        *,
+        content: str,
+        conversation_id: str | None = None,
+        response_id: str | None = None,
+        delivery_id: str | None = None,
+    ) -> DeliveryRecord:
+        """Create and persist a ``pending`` delivery record."""
+        now = _clock()
+        record = DeliveryRecord(
+            schema_version=SCHEMA_VERSION,
+            delivery_id=delivery_id or f"delivery_{uuid.uuid4().hex}",
+            conversation_id=conversation_id,
+            response_id=response_id,
+            normalized_content_hash=normalized_content_hash(content),
+            state=DeliveryState.PENDING.value,
+            created_at=now,
+            updated_at=now,
+        )
+        self._write_atomic(record)
+        return record
+
+    def get(self, delivery_id: str) -> DeliveryRecord | None:
+        """Return one record, or None if the entry does not exist.
+
+        Corruption (a malformed/unsupported/truncated record) is NOT absence:
+        a corrupt entry may hide an in-flight delivery, so a JSON decode failure
+        raises JournalCorruptError rather than returning None. Only a genuinely
+        missing entry returns None.
+        """
+        path = self._path(delivery_id)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise JournalCorruptError(
+                f"unreadable JSON for delivery {delivery_id}: {exc}"
+            ) from exc
+        return _record_from_dict(data)  # raises JournalCorruptError if corrupt
+
+    def _scan(self) -> tuple[list[DeliveryRecord], list[str]]:
+        """Read every entry, splitting good records from unreadable descriptions.
+
+        Unreadable (unparseable JSON or a corrupt/unsupported record) entries are
+        collected separately so callers can treat them as fail-closed state
+        rather than silently absent records. Good records are sorted by creation
+        time so the most recent record for a prompt is found first.
+        """
+        records: list[DeliveryRecord] = []
+        unreadable: list[str] = []
+        if self._dir.is_dir():
+            for entry in self._dir.glob("*.json"):
+                try:
+                    data = json.loads(entry.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    unreadable.append(entry.name)
+                    continue
+                try:
+                    record = _record_from_dict(data)
+                except JournalCorruptError as exc:
+                    unreadable.append(f"{entry.name}: {exc}")
+                    continue
+                records.append(record)
+        records.sort(key=lambda r: r.created_at)
+        return records, unreadable
+
+    def load_all(self) -> list[DeliveryRecord]:
+        records, unreadable = self._scan()
+        self._unreadable = unreadable
+        return records
+
+    def unreadable_records(self) -> list[str]:
+        """Descriptions of journal entries that cannot be safely interpreted.
+
+        Non-empty means the journal holds corrupt or unsupported-schema state
+        that MUST NOT be treated as absent — the loader cannot tell whether
+        such a record represents an in-flight delivery, so the harness must
+        refuse injection (recovery_required) rather than risk replaying it.
+        Performs a fresh scan (independent of load_all()).
+        """
+        _records, unreadable = self._scan()
+        return unreadable
+
+    def ensure_clean(self) -> None:
+        """Raise if the journal holds ANY unreadable entry.
+
+        Every mutating/correlating operation must refuse to proceed while the
+        journal is corrupt: a skipped corrupt entry could hide an in-flight
+        delivery and let an unrelated singleton be confirmed (replay). Callers
+        that can surface a typed result (executor turns, server confirmation)
+        treat JournalCorruptError as fail-closed.
+        """
+        unreadable = self.unreadable_records()
+        if unreadable:
+            raise JournalCorruptError(
+                f"journal holds {len(unreadable)} unreadable record(s): {unreadable}"
+            )
+
+    def reconcile_failures(self) -> list[str]:
+        """Recovery transitions that could not be written, read fresh each call.
+
+        The set is durable (a marker in the delivery dir) so a reconcile
+        durability failure recorded by a HOT RECREATE in a separate process —
+        which builds its own journal and would otherwise discard the failure —
+        is seen by the active executor before every injection. Merged with this
+        instance's own in-memory failures.
+        """
+        failures: list[str] = list(self._reconcile_failures)
+        try:
+            data = json.loads(self._reconcile_failures_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return failures
+        if isinstance(data, dict) and isinstance(data.get("failures"), list):
+            for item in data["failures"]:
+                if isinstance(item, str) and item not in failures:
+                    failures.append(item)
+        return failures
+
+    def _reconcile_failures_path(self) -> Path:
+        return self._dir / ".reconcile_failures.json"
+
+    def _persist_reconcile_failures(self, failures: list[str]) -> None:
+        """Best-effort durable record of the current reconcile-failure set.
+
+        The disk may already be failing (that is why a recovery write failed),
+        so this is best-effort: os.replace without a hard fsync requirement and
+        all errors swallowed. It only needs to survive the hot-recreate boundary
+        to a separate process; the active executor re-runs reconcile on its own
+        startup. An empty set clears the marker so a successful reconcile stops
+        blocking injection.
+        """
+        path = self._reconcile_failures_path()
+        try:
+            if not failures:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                return
+            self._ensure_dir()
+            fd, temporary = tempfile.mkstemp(dir=self._dir, prefix=".reconcile.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"failures": failures}, handle)
+                    handle.flush()
+                    with contextlib.suppress(OSError):
+                        os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temporary)
+        except OSError:
+            pass  # disk too broken to record; the active executor's own reconcile is the backstop
+
+    def open_prompt_lock(self, conversation_id: str | None, content: str) -> int:
+        """Open (create) the per-(conversation, prompt) lock file; return its fd.
+
+        The caller takes an exclusive ``fcntl`` flock on the fd — preferably via a
+        worker thread so a contended acquire cannot block an event loop — holds it
+        across the scan -> create -> submission_started -> paste critical section,
+        then calls :meth:`close_prompt_lock`. Keyed by the owning conversation and
+        the paste-canonical content digest. Each caller opens its own descriptor,
+        so the flock serializes across processes AND threads (two descriptors on
+        the same lock file conflict).
+        """
+        self._ensure_dir()
+        digest = normalized_content_hash(content)
+        key = hashlib.sha256(f"{conversation_id or ''}\0{digest}".encode()).hexdigest()
+        lock_path = self._dir / f".prompt.{key}.flock"
+        return os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+    @staticmethod
+    def close_prompt_lock(fd: int) -> None:
+        """Release the exclusive flock and close the fd (idempotent on release)."""
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    @contextmanager
+    def prompt_lock(self, conversation_id: str | None, content: str):
+        """Sync exclusive lock for one (conversation, prompt) (tests/sync callers).
+
+        Acquires a blocking ``fcntl`` flock; do NOT use inside an event loop where
+        contention could block it — async callers use :meth:`open_prompt_lock` and
+        acquire the flock via a worker thread.
+        """
+        fd = self.open_prompt_lock(conversation_id, content)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            self.close_prompt_lock(fd)
+
+    def _transition(
+        self,
+        delivery_id: str,
+        target: DeliveryState,
+        *,
+        reason: str | None = None,
+        response_id: str | None = None,
+        confirmed_item_id: str | None = None,
+        idempotent: bool = True,
+    ) -> DeliveryRecord | None:
+        """Compare-and-swap a monotonic state transition under a record lock.
+
+        Returns the updated record, or ``None`` if the record is missing or the
+        transition would regress the state machine. When ``idempotent`` is True
+        (default) a record already in ``target`` returns the current record; when
+        False it returns ``None`` so a non-idempotent transition (notably
+        ``submission_started``) cannot authorize a second caller — the P0
+        invariant is one paste per delivery_id.
+        """
+        with self._record_lock(delivery_id):
+            record = self.get(delivery_id)
+            if record is None:
+                return None
+            current: DeliveryState
+            try:
+                current = DeliveryState(record.state)
+            except ValueError:
+                return None
+            if current == target:
+                return record if idempotent else None
+            if current not in _ALLOWED_SOURCES[target]:
+                return None  # regression rejected
+            updated = replace(
+                record,
+                state=target.value,
+                updated_at=_clock(),
+                reason=sanitize_reason(reason) if reason is not None else record.reason,
+                response_id=response_id if response_id is not None else record.response_id,
+                confirmed_item_id=(
+                    confirmed_item_id
+                    if confirmed_item_id is not None
+                    else record.confirmed_item_id
+                ),
+            )
+            self._write_atomic(updated)
+            return updated
+
+    def mark_submission_started(self, delivery_id: str) -> DeliveryRecord | None:
+        """Advance a record to ``submission_started`` (durable BEFORE paste).
+
+        Non-idempotent: only a ``pending -> submission_started`` transition
+        succeeds and returns the record. A record already ``submission_started``
+        returns ``None`` so a second caller cannot be authorized to paste the
+        same delivery_id again (the paste path treats ``None`` as a hard stop).
+        """
+        return self._transition(delivery_id, DeliveryState.SUBMISSION_STARTED, idempotent=False)
+
+    def confirm(
+        self,
+        delivery_id: str,
+        *,
+        response_id: str | None = None,
+        confirmed_item_id: str | None = None,
+    ) -> DeliveryRecord | None:
+        """Advance a record to ``confirmed`` once the plugin mirrors it."""
+        return self._transition(
+            delivery_id,
+            DeliveryState.CONFIRMED,
+            response_id=response_id,
+            confirmed_item_id=confirmed_item_id,
+        )
+
+    def confirm_outstanding(
+        self,
+        *,
+        response_id: str,
+        expected_thread_id: str | None = None,
+        confirmed_item_id: str | None = None,
+        content: str | None = None,
+    ) -> ConfirmationOutcome:
+        """Confirm the outstanding delivery for a plugin mirror.
+
+        Correlates the plugin-mirrored user message (carrying a ``response_id``
+        of ``<thread_id>:<event_id>`` from the matching ``agent.start``) with
+        the matching delivery record and stamps the durable Omnigent item id so
+        a duplicate post can return it.
+
+        A confirmation may arrive AFTER a restart reconcile moved the delivery
+        to ``recovery_required`` (the mirror raced the recreate window), so
+        candidates include both ``submission_started`` and ``recovery_required``
+        records. The correlation prefers a record already stamped with this
+        ``response_id`` (a retried post), then falls back to the
+        paste-canonical content digest when no response_id is stamped yet
+        (the first mirror, which arrives without a prior correlation).
+        Confirmation is idempotent: a confirmed record is never re-confirmed,
+        and a confirmed-then-recovery transition is impossible (the table
+        forbids it). Zero or ambiguous candidates are a no-op (never guess).
+        """
+        if expected_thread_id and not _response_id_matches_thread(response_id, expected_thread_id):
+            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
+        # Refuse to correlate while the journal is corrupt: a skipped unreadable
+        # entry could hide an in-flight delivery and let an unrelated singleton be
+        # confirmed (replay). Fail closed.
+        self.ensure_clean()
+        records = self.load_all()
+        already = any(
+            r.state == DeliveryState.CONFIRMED.value and r.response_id == response_id
+            for r in records
+        )
+        if already:
+            # This response_id is already durably confirmed: do NOT select (and
+            # confirm) another outstanding candidate. A duplicate post must be a
+            # no-op, never a second confirmation.
+            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=True)
+        candidates = [
+            r
+            for r in records
+            if r.state
+            in (
+                DeliveryState.SUBMISSION_STARTED.value,
+                DeliveryState.RECOVERY_REQUIRED.value,
+            )
+        ]
+        target = self._select_confirm_target(candidates, response_id, content)
+        if target is None:
+            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
+        updated = self.confirm(
+            target.delivery_id,
+            response_id=response_id,
+            confirmed_item_id=confirmed_item_id,
+        )
+        if updated is None:
+            # Lost a race to a terminal state (e.g. reconcile to confirmed via a
+            # duplicate). Harmless: the item is already durably represented.
+            current = self.get(target.delivery_id)
+            now_confirmed = current is not None and current.state == DeliveryState.CONFIRMED.value
+            return ConfirmationOutcome(
+                confirmed=False,
+                delivery_id=target.delivery_id,
+                already_confirmed=now_confirmed,
+            )
+        return ConfirmationOutcome(
+            confirmed=updated.state == DeliveryState.CONFIRMED.value,
+            delivery_id=updated.delivery_id,
+            already_confirmed=False,
+        )
+
+    @staticmethod
+    def _select_confirm_target(
+        candidates: list[DeliveryRecord], response_id: str, content: str | None
+    ) -> DeliveryRecord | None:
+        """Pick the single delivery a plugin mirror confirms.
+
+        Prefer an already-stamped ``response_id`` match (a retried post); else,
+        when mirror ``content`` is supplied, require a paste-canonical digest
+        match (the first mirror) — a wrong-content mirror must NOT confirm an
+        unrelated singleton. When no content is supplied, a single outstanding
+        candidate is unambiguous and resolves directly. Anything ambiguous
+        resolves to None so the caller never guesses.
+        """
+        by_response_id = [r for r in candidates if r.response_id == response_id]
+        if len(by_response_id) == 1:
+            return by_response_id[0]
+        if len(by_response_id) > 1:
+            return None
+        if content is not None:
+            digest = normalized_content_hash(content)
+            by_hash = [r for r in candidates if r.normalized_content_hash == digest]
+            if len(by_hash) == 1:
+                return by_hash[0]
+            return None  # wrong/ambiguous content: refuse rather than guess
+        # No content to correlate: a single outstanding record is unambiguous.
+        return candidates[0] if len(candidates) == 1 else None
+
+    def mark_recovery_required(
+        self, delivery_id: str, *, reason: str | None = None
+    ) -> DeliveryRecord | None:
+        return self._transition(delivery_id, DeliveryState.RECOVERY_REQUIRED, reason=reason)
+
+    def mark_failed(self, delivery_id: str, *, reason: str | None = None) -> DeliveryRecord | None:
+        return self._transition(delivery_id, DeliveryState.FAILED, reason=reason)
+
+    def reconcile_on_start(self) -> list[DeliveryRecord]:
+        """Transition any non-terminal record to ``recovery_required``.
+
+        A record in ``pending``/``submission_started`` has no proven outcome
+        after a restart — Amp may already have committed the prompt. It must
+        NEVER be automatically resubmitted. Each such record is durably marked
+        ``recovery_required`` so the harness surfaces an actionable typed
+        result and a human/explicit path decides replay. Terminal records
+        (confirmed/failed/recovery_required) are never regressed.
+        """
+        recovered: list[DeliveryRecord] = []
+        failures: list[str] = []
+        for record in self.load_all():
+            try:
+                state = DeliveryState(record.state)
+            except ValueError:
+                continue
+            if state in _NON_TERMINAL_STATES:
+                # Lock per record to avoid clobbering a concurrent confirm.
+                with self._record_lock(record.delivery_id):
+                    current = self.get(record.delivery_id)
+                    if current is None:
+                        continue
+                    try:
+                        cur_state = DeliveryState(current.state)
+                    except ValueError:
+                        continue
+                    if cur_state not in _NON_TERMINAL_STATES:
+                        continue  # raced to terminal; do not regress
+                    updated = replace(
+                        current,
+                        state=DeliveryState.RECOVERY_REQUIRED.value,
+                        updated_at=_clock(),
+                        reason=f"restart interrupted delivery in {cur_state.value}",
+                    )
+                    try:
+                        self._write_atomic(updated)
+                    except DurabilityError as exc:
+                        # The recovery transition itself could not be persisted.
+                        # The record stays non-terminal; record this (durably,
+                        # so a hot recreate in another process surfaces it too)
+                        # so the harness fails closed rather than crashing or
+                        # silently treating the record as resolved.
+                        failures.append(f"{current.delivery_id}: {exc}")
+                        continue
+                    recovered.append(updated)
+        # Persist the current failure set so the active executor (and any hot
+        # recreate in a separate process) blocks injection until it is resolved.
+        self._reconcile_failures = failures
+        self._persist_reconcile_failures(failures)
+        return recovered
+
+    def has_outstanding_delivery(self) -> bool:
+        """Whether any record is still pending or submission_started."""
+        return any(_safe_state(record) in _NON_TERMINAL_STATES for record in self.load_all())
+
+
+def _response_id_matches_thread(response_id: str, expected_thread_id: str) -> bool:
+    """A response_id ``<thread>:<event>`` belongs to the expected thread."""
+    if not expected_thread_id:
+        return True
+    prefix = response_id.split(":", 1)[0]
+    return prefix == expected_thread_id
+
+
+def _safe_state(record: DeliveryRecord) -> DeliveryState | None:
+    try:
+        return DeliveryState(record.state)
+    except ValueError:
+        return None
+
+
+def _record_from_dict(data: Any) -> DeliveryRecord:
+    """Parse one persisted record, raising JournalCorruptError on ANY bad shape.
+
+    A non-dict body, an unknown schema version, a missing field, a bad type, or
+    an invalid state enum value are ALL corruption (never absence): the record
+    could represent an in-flight delivery the loader cannot interpret, so it
+    must be surfaced and treated as fail-closed rather than silently skipped.
+    """
+    if not isinstance(data, dict):
+        raise JournalCorruptError("record is not a JSON object")
+    try:
+        schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            # A record from an unknown/future schema cannot be interpreted
+            # safely — surface it (raise) rather than silently dropping it,
+            # which would hide a possible in-flight delivery and allow replay.
+            raise JournalCorruptError(f"unsupported schema_version={schema_version}")
+        state = str(data["state"])
+        try:
+            DeliveryState(state)
+        except ValueError as exc:
+            raise JournalCorruptError(f"invalid state={state!r}") from exc
+        return DeliveryRecord(
+            schema_version=schema_version,
+            delivery_id=str(data["delivery_id"]),
+            conversation_id=data.get("conversation_id"),
+            response_id=data.get("response_id"),
+            normalized_content_hash=str(data["normalized_content_hash"]),
+            state=state,
+            created_at=float(data["created_at"]),
+            updated_at=float(data["updated_at"]),
+            attempts=int(data.get("attempts", 0)),
+            reason=data.get("reason"),
+            confirmed_item_id=data.get("confirmed_item_id"),
+        )
+    except JournalCorruptError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalCorruptError(f"malformed delivery record: {exc}") from exc
+
+
+def contextlib_suppress_oserror() -> Any:
+    """Lazy ``contextlib.suppress(OSError)`` for temp-file cleanup only."""
+    import contextlib
+
+    return contextlib.suppress(OSError)
