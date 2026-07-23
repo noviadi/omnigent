@@ -17,7 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from omnigent.amp_native_delivery import DeliveryJournal
+from omnigent.amp_native_delivery import DeliveryJournal, canonical_prompt
 
 AMP_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_AMP_NATIVE_BRIDGE_DIR"
 AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_AMP_NATIVE_REQUEST_SESSION_ID"
@@ -42,6 +42,16 @@ class InjectionHooks:
     before_paste: Callable[[], None] | None = None
     after_paste: Callable[[], None] | None = None
     after_enter: Callable[[], None] | None = None
+
+
+class InjectionPreconditionError(RuntimeError):
+    """A pre-paste check failed before any byte could reach Amp.
+
+    Distinct from a plain ``RuntimeError`` raised by a tmux mutation or a
+    fault hook: the delivery record is still ``pending``, so the executor may
+    safely mark it ``failed``. A mutation/hook failure leaves the record
+    ``submission_started`` and must become ``recovery_required`` instead.
+    """
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -102,8 +112,8 @@ def inject_user_message(
     path: Path,
     content: str,
     *,
-    journal: DeliveryJournal | None = None,
-    delivery_id: str | None = None,
+    journal: DeliveryJournal,
+    delivery_id: str,
     hooks: InjectionHooks | None = None,
 ) -> None:
     """Paste a browser prompt into the resident Amp TUI.
@@ -114,15 +124,26 @@ def inject_user_message(
     The plugin observes the resulting ``agent.start`` and mirrors the user item
     back through Omnigent's pending-input reconciliation path.
 
-    When a ``journal`` and ``delivery_id`` are supplied, the delivery state is
-    advanced atomically (write + ``fsync``) to ``submission_started`` BEFORE any
-    paste or Enter byte can reach Amp. A crash after that point therefore leaves
-    a durable record the runner reconciles into ``recovery_required`` on restart
-    rather than silently re-injecting the prompt. ``hooks`` expose the three
-    paste/Enter boundary points for fault-injection tests.
+    Production injection REQUIRES a delivery ``journal`` and ``delivery_id``:
+    the record is advanced atomically (write + fail-closed ``fsync``) to
+    ``submission_started`` BEFORE any paste or Enter byte can reach Amp. A crash
+    after that point therefore leaves a durable record the runner reconciles
+    into ``recovery_required`` on restart rather than silently re-injecting the
+    prompt. ``hooks`` expose the three paste/Enter boundary points for
+    fault-injection tests.
+
+    Errors split by phase: pre-paste checks raise
+    :class:`InjectionPreconditionError` (no byte could have reached Amp, so the
+    record may safely become ``failed``); any failure from the first tmux
+    mutation onward propagates as a plain ``RuntimeError`` (the record is
+    ``submission_started`` → ``recovery_required``).
     """
+    if journal is None or not delivery_id:
+        raise InjectionPreconditionError(
+            "amp-native production injection requires a journal and delivery_id"
+        )
     if not content:
-        raise RuntimeError("amp-native injection requires non-empty content")
+        raise InjectionPreconditionError("amp-native injection requires non-empty content")
     deadline = time.monotonic() + 5.0
     info: dict[str, Any] | None = None
     while time.monotonic() < deadline:
@@ -139,7 +160,7 @@ def inject_user_message(
             break
         time.sleep(0.05)
     if info is None:
-        raise RuntimeError("amp-native tmux target was not advertised within 5s")
+        raise InjectionPreconditionError("amp-native tmux target was not advertised within 5s")
 
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
@@ -152,24 +173,25 @@ def inject_user_message(
             timeout=5.0,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"amp-native could not inspect tmux session: {exc}") from exc
+        raise InjectionPreconditionError(
+            f"amp-native could not inspect tmux session: {exc}"
+        ) from exc
     if alive.returncode != 0:
-        raise RuntimeError("amp terminal is no longer running; restart the session")
+        raise InjectionPreconditionError("amp terminal is no longer running; restart the session")
 
-    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    # Same canonical form the delivery hash uses, so a digest match is meaningful.
     payload = bytearray()
-    for character in normalized:
+    for character in canonical_prompt(content):
         if character == "\n":
             payload.append(0x0D)
         elif character == "\t":
             payload.append(0x09)
-        elif ord(character) >= 0x20:
+        else:
             payload.extend(character.encode("utf-8"))
 
     # Durable submission marker BEFORE any paste/Enter byte can reach Amp.
-    # Once this is on disk the runner must never blindly replay the prompt.
-    if journal is not None and delivery_id is not None:
-        journal.mark_submission_started(delivery_id)
+    # fsync failure here must fail closed — do not proceed to paste.
+    journal.mark_submission_started(delivery_id)
     if hooks is not None and hooks.before_paste is not None:
         hooks.before_paste()
     with tempfile.NamedTemporaryFile(dir=path, prefix="paste_", delete=False) as paste:
