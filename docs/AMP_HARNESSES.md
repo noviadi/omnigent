@@ -3,9 +3,11 @@
 **Status:** interactive MVP implemented on `feat/amp-native`; direct harness
 planned, not implemented
 
-**Harness:** `amp-native`
+**Implemented harness:** `amp-native`
 
-**Alias:** `native-amp`
+**Implemented alias:** `native-amp`
+
+**Planned direct harness:** `amp` or `amp-direct` (name to be confirmed)
 
 **CLI:** `omnigent amp`
 
