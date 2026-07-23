@@ -59,7 +59,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from omnigent._wrapper_labels import AMP_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
 from omnigent.amp_native_bridge import bridge_dir_for_session_id
-from omnigent.amp_native_delivery import DeliveryJournal
+from omnigent.amp_native_delivery import DeliveryJournal, DurabilityError
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -5401,7 +5401,7 @@ def _confirm_amp_native_delivery(
             confirmed_item_id=item_id,
             content=content,
         )
-    except OSError:
+    except (OSError, DurabilityError):
         _logger.warning("amp-native delivery confirmation failed for session %s", session_id)
 
 

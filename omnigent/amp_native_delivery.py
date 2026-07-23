@@ -175,6 +175,17 @@ class DurabilityError(RuntimeError):
     """
 
 
+class JournalCorruptError(RuntimeError):
+    """Raised when a journal record cannot be safely interpreted.
+
+    An unknown schema version or a malformed record is NOT the same as an
+    absent record: the loader cannot tell whether such an entry represents an
+    in-flight delivery, so it must be surfaced (never silently dropped) and the
+    harness must refuse to inject until it is reconciled, otherwise a corrupt
+    record hides a prior delivery and a new paste replays it.
+    """
+
+
 @dataclass(frozen=True)
 class ConfirmationOutcome:
     """Result of correlating a plugin mirror with an outstanding delivery."""
@@ -197,6 +208,10 @@ class DeliveryJournal:
     def __init__(self, bridge_dir: Path) -> None:
         self._bridge_dir = bridge_dir
         self._dir = bridge_dir / _DELIVERY_DIR
+        # Populated by the most recent load_all(); prefer unreadable_records()
+        # for a fresh scan. Tracks corrupt/unsupported entries so they are
+        # never silently treated as absent (see JournalCorruptError).
+        self._unreadable: list[str] = []
 
     @property
     def root(self) -> Path:
@@ -290,24 +305,54 @@ class DeliveryJournal:
         path = self._path(delivery_id)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            return _record_from_dict(data)
+        except (OSError, ValueError, JournalCorruptError):
             return None
-        return _record_from_dict(data)
 
     def load_all(self) -> list[DeliveryRecord]:
-        if not self._dir.is_dir():
-            return []
         records: list[DeliveryRecord] = []
+        unreadable: list[str] = []
+        if self._dir.is_dir():
+            for entry in self._dir.glob("*.json"):
+                try:
+                    data = json.loads(entry.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    unreadable.append(entry.name)
+                    continue
+                try:
+                    record = _record_from_dict(data)
+                except JournalCorruptError as exc:
+                    unreadable.append(f"{entry.name}: {exc}")
+                    continue
+                if record is not None:
+                    records.append(record)
+        self._unreadable = unreadable
+        records.sort(key=lambda r: r.created_at)
+        return records
+
+    def unreadable_records(self) -> list[str]:
+        """Descriptions of journal entries that cannot be safely interpreted.
+
+        Non-empty means the journal holds corrupt or unsupported-schema state
+        that MUST NOT be treated as absent — the loader cannot tell whether
+        such a record represents an in-flight delivery, so the harness must
+        refuse injection (recovery_required) rather than risk replaying it.
+        Performs a fresh scan (independent of load_all()).
+        """
+        unreadable: list[str] = []
+        if not self._dir.is_dir():
+            return unreadable
         for entry in self._dir.glob("*.json"):
             try:
                 data = json.loads(entry.read_text(encoding="utf-8"))
             except (OSError, ValueError):
+                unreadable.append(entry.name)
                 continue
-            record = _record_from_dict(data)
-            if record is not None:
-                records.append(record)
-        records.sort(key=lambda r: r.created_at)
-        return records
+            try:
+                _record_from_dict(data)
+            except JournalCorruptError as exc:
+                unreadable.append(f"{entry.name}: {exc}")
+        return unreadable
 
     def _transition(
         self,
@@ -317,12 +362,16 @@ class DeliveryJournal:
         reason: str | None = None,
         response_id: str | None = None,
         confirmed_item_id: str | None = None,
+        idempotent: bool = True,
     ) -> DeliveryRecord | None:
         """Compare-and-swap a monotonic state transition under a record lock.
 
-        Returns the updated record, the current record if the transition is
-        already satisfied (idempotent), or ``None`` if the record is missing or
-        the transition would regress the state machine.
+        Returns the updated record, or ``None`` if the record is missing or the
+        transition would regress the state machine. When ``idempotent`` is True
+        (default) a record already in ``target`` returns the current record; when
+        False it returns ``None`` so a non-idempotent transition (notably
+        ``submission_started``) cannot authorize a second caller — the P0
+        invariant is one paste per delivery_id.
         """
         with self._record_lock(delivery_id):
             record = self.get(delivery_id)
@@ -334,7 +383,7 @@ class DeliveryJournal:
             except ValueError:
                 return None
             if current == target:
-                return record  # idempotent re-transition
+                return record if idempotent else None
             if current not in _ALLOWED_SOURCES[target]:
                 return None  # regression rejected
             updated = replace(
@@ -353,8 +402,14 @@ class DeliveryJournal:
             return updated
 
     def mark_submission_started(self, delivery_id: str) -> DeliveryRecord | None:
-        """Advance a record to ``submission_started`` (durable BEFORE paste)."""
-        return self._transition(delivery_id, DeliveryState.SUBMISSION_STARTED)
+        """Advance a record to ``submission_started`` (durable BEFORE paste).
+
+        Non-idempotent: only a ``pending -> submission_started`` transition
+        succeeds and returns the record. A record already ``submission_started``
+        returns ``None`` so a second caller cannot be authorized to paste the
+        same delivery_id again (the paste path treats ``None`` as a hard stop).
+        """
+        return self._transition(delivery_id, DeliveryState.SUBMISSION_STARTED, idempotent=False)
 
     def confirm(
         self,
@@ -404,6 +459,11 @@ class DeliveryJournal:
             r.state == DeliveryState.CONFIRMED.value and r.response_id == response_id
             for r in records
         )
+        if already:
+            # This response_id is already durably confirmed: do NOT select (and
+            # confirm) another outstanding candidate. A duplicate post must be a
+            # no-op, never a second confirmation.
+            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=True)
         candidates = [
             r
             for r in records
@@ -415,9 +475,7 @@ class DeliveryJournal:
         ]
         target = self._select_confirm_target(candidates, response_id, content)
         if target is None:
-            return ConfirmationOutcome(
-                confirmed=False, delivery_id=None, already_confirmed=already
-            )
+            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
         updated = self.confirm(
             target.delivery_id,
             response_id=response_id,
@@ -445,11 +503,12 @@ class DeliveryJournal:
     ) -> DeliveryRecord | None:
         """Pick the single delivery a plugin mirror confirms.
 
-        Prefer an already-stamped ``response_id`` match (a retried post); else
-        match by the paste-canonical content digest (the first mirror); else
-        resolve a single unambiguous outstanding candidate. Zero-or-many after
-        all of those is ambiguous and resolves to None so the caller never
-        guesses which delivery a mirror confirms.
+        Prefer an already-stamped ``response_id`` match (a retried post); else,
+        when mirror ``content`` is supplied, require a paste-canonical digest
+        match (the first mirror) — a wrong-content mirror must NOT confirm an
+        unrelated singleton. When no content is supplied, a single outstanding
+        candidate is unambiguous and resolves directly. Anything ambiguous
+        resolves to None so the caller never guesses.
         """
         by_response_id = [r for r in candidates if r.response_id == response_id]
         if len(by_response_id) == 1:
@@ -461,9 +520,8 @@ class DeliveryJournal:
             by_hash = [r for r in candidates if r.normalized_content_hash == digest]
             if len(by_hash) == 1:
                 return by_hash[0]
-            if len(by_hash) > 1:
-                return None
-        # Single outstanding record is unambiguous: confirm it.
+            return None  # wrong/ambiguous content: refuse rather than guess
+        # No content to correlate: a single outstanding record is unambiguous.
         return candidates[0] if len(candidates) == 1 else None
 
     def mark_recovery_required(
@@ -539,9 +597,9 @@ def _record_from_dict(data: dict[str, Any]) -> DeliveryRecord | None:
         schema_version = int(data.get("schema_version", SCHEMA_VERSION))
         if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             # A record from an unknown/future schema cannot be interpreted
-            # safely with the current shape — skip it rather than risk a
-            # misread that corrupts the monotonic state machine on write.
-            return None
+            # safely — surface it (raise) rather than silently dropping it,
+            # which would hide a possible in-flight delivery and allow replay.
+            raise JournalCorruptError(f"unsupported schema_version={schema_version}")
         return DeliveryRecord(
             schema_version=schema_version,
             delivery_id=str(data["delivery_id"]),
@@ -555,8 +613,10 @@ def _record_from_dict(data: dict[str, Any]) -> DeliveryRecord | None:
             reason=data.get("reason"),
             confirmed_item_id=data.get("confirmed_item_id"),
         )
-    except (KeyError, TypeError, ValueError):
-        return None
+    except JournalCorruptError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        raise JournalCorruptError(f"malformed delivery record: {exc}") from exc
 
 
 def contextlib_suppress_oserror() -> Any:

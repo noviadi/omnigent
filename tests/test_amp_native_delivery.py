@@ -410,6 +410,145 @@ def test_fsync_failure_is_fail_closed_no_paste(
     assert fake_tmux.enter_calls == 0
 
 
+def test_concurrent_injection_pastes_at_most_once(fake_tmux: _FakeTmux) -> None:
+    """Two callers racing the same delivery_id authorize exactly one paste.
+
+    The P0 invariant is one paste per delivery_id. ``mark_submission_started``
+    is non-idempotent: under its per-record fcntl CAS only one caller advances
+    pending -> submission_started, so a second caller's submission-start returns
+    None and the paste path treats that as a hard stop (InjectionPreconditionError).
+    """
+    import threading
+
+    journal = DeliveryJournal(fake_tmux.bridge)
+    record = journal.create(content="once only", conversation_id="conv_1")
+
+    errors: list[BaseException] = []
+
+    def _inject() -> None:
+        try:
+            inject_user_message(
+                fake_tmux.bridge,
+                "once only",
+                journal=journal,
+                delivery_id=record.delivery_id,
+            )
+        except InjectionPreconditionError as exc:
+            errors.append(exc)
+        except BaseException as exc:  # pragma: no cover - unexpected
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_inject) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one paste+Enter reached Amp; the rest hit the hard stop.
+    assert fake_tmux.paste_calls == 1
+    assert fake_tmux.enter_calls == 1
+    assert len(errors) == len(threads) - 1
+    assert all(isinstance(e, InjectionPreconditionError) for e in errors)
+
+
+def test_confirm_outstanding_no_op_when_response_id_already_confirmed(
+    tmp_path: Path,
+) -> None:
+    """A duplicate response_id (retried plugin post) is a no-op, not a second
+    confirmation of a different outstanding delivery."""
+    journal = DeliveryJournal(tmp_path / "bridge")
+    first = journal.create(content="first", conversation_id="T-1")
+    journal.mark_submission_started(first.delivery_id)
+    journal.confirm(first.delivery_id, response_id="T-1:ev_1", confirmed_item_id="item_1")
+    # A second outstanding delivery exists that would otherwise match the thread.
+    second = journal.create(content="second", conversation_id="T-1")
+    journal.mark_submission_started(second.delivery_id)
+
+    outcome = journal.confirm_outstanding(
+        response_id="T-1:ev_1", expected_thread_id="T-1", confirmed_item_id="item_2"
+    )
+    # Already confirmed -> no-op; the duplicate must NOT confirm the second one.
+    assert outcome.confirmed is False
+    assert outcome.already_confirmed is True
+    assert journal.get(second.delivery_id).state == DeliveryState.SUBMISSION_STARTED.value
+
+
+def test_confirm_outstanding_refuses_wrong_content_on_singleton(tmp_path: Path) -> None:
+    """A mirror whose content digest doesn't match must NOT confirm an unrelated
+    singleton — refuse rather than guess."""
+    journal = DeliveryJournal(tmp_path / "bridge")
+    record = journal.create(content="the real prompt", conversation_id="T-1")
+    journal.mark_submission_started(record.delivery_id)
+
+    outcome = journal.confirm_outstanding(
+        response_id="T-1:ev_2",
+        expected_thread_id="T-1",
+        confirmed_item_id="item_x",
+        content="a completely different prompt",
+    )
+    assert outcome.confirmed is False
+    assert journal.get(record.delivery_id).state == DeliveryState.SUBMISSION_STARTED.value
+
+
+def test_failure_transition_durable_error_is_typed(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DurabilityError while persisting the recovery transition must itself
+    become a typed RECOVERY result — never a raw stack trace."""
+
+    class _FaultyExecutor(AmpNativeExecutor):
+        def _injection_hooks(self) -> InjectionHooks:
+            return _hooks("after_paste")
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    executor = _FaultyExecutor(bridge_dir=bridge)
+
+    # The recovery transition's fsync fails after the paste already reached Amp.
+    def _boom_mark(delivery_id: str, reason: str | None = None) -> None:
+        from omnigent.amp_native_delivery import DurabilityError
+
+        raise DurabilityError("simulated recovery-transition fsync failure")
+
+    monkeypatch.setattr(executor.journal, "mark_recovery_required", _boom_mark)
+
+    messages = [{"role": "user", "content": "maybe pasted"}]
+    # Must not raise: the durability failure surfaces as the typed result.
+    events = asyncio.run(_drive_turn(executor, messages))
+    assert executor_module.RECOVERY_ERROR_CODE in " ".join(events)
+    # The paste reached Amp; only the recovery write failed.
+    assert fake_tmux.paste_calls == 1
+
+
+def test_unreadable_journal_blocks_new_injection(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt/unknown-schema journal record must NEVER be treatable as absent:
+    the harness refuses to inject (no paste) until the journal is reconciled."""
+    import json
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    journal = DeliveryJournal(bridge)
+    stale = journal.create(content="unknown", conversation_id="conv_1")
+    path = bridge / "delivery" / f"{stale.delivery_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["schema_version"] = 99  # unknown future version
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+    assert executor.journal.unreadable_records()
+
+    messages = [{"role": "user", "content": "a brand new question"}]
+    events = asyncio.run(_drive_turn(executor, messages))
+    assert executor_module.RECOVERY_ERROR_CODE in " ".join(events)
+    # No paste reached Amp: corrupt state blocks new injection.
+    assert fake_tmux.paste_calls == 0
+    assert fake_tmux.enter_calls == 0
+
+
 # --------------------------------------------------------------------------- #
 # Terminal-recreate survival + runner reconciliation
 # --------------------------------------------------------------------------- #
@@ -901,7 +1040,7 @@ def test_executor_emits_typed_failed_on_durability_error(
 
 def test_journal_rejects_unknown_schema_version(tmp_path: Path) -> None:
     """A record written by an unknown/future schema version is not interpreted
-    with the current shape (returns None) rather than silently accepted."""
+    with the current shape and is SURFACED (never silently dropped)."""
     import json
 
     journal = DeliveryJournal(tmp_path / "bridge")
@@ -912,6 +1051,8 @@ def test_journal_rejects_unknown_schema_version(tmp_path: Path) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
     assert journal.get(record.delivery_id) is None
     assert journal.load_all() == []
+    # The unreadable record is surfaced, not treated as absent (no silent replay).
+    assert journal.unreadable_records()
 
 
 def test_live_queue_refusal_surfaces_on_session_event_stream(

@@ -73,6 +73,13 @@ class AmpNativeExecutor(Executor):
             raise RuntimeError(f"{AMP_NATIVE_BRIDGE_DIR_ENV_VAR} is required")
         self._conversation_id = os.environ.get(AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR)
         self._journal = DeliveryJournal(self._bridge_dir)
+        # Corrupt or unsupported-schema journal entries are NOT absent: the
+        # loader cannot tell whether such a record represents an in-flight
+        # delivery, so any unreadable state blocks new injection (see the guard
+        # in enqueue_session_message / run_turn). Surface it at startup so a
+        # recovery refusal is traceable rather than silent.
+        for note in self._journal.unreadable_records():
+            _logger.warning("amp-native journal holds an unreadable record: %s", note)
         # Reconcile any delivery left mid-flight by a prior process: a record
         # in pending/submission_started has no proven outcome and must NEVER be
         # automatically resubmitted. It becomes recovery_required so a retry
@@ -95,6 +102,57 @@ class AmpNativeExecutor(Executor):
 
     def supports_live_message_queue(self) -> bool:
         return True
+
+    def _unreadable_block_reason(self) -> str | None:
+        """Return a typed recovery reason if the journal holds unreadable state.
+
+        A corrupt or unsupported-schema record could represent an in-flight
+        delivery the loader can't interpret, so it must never be treated as
+        absent. Any unreadable entry blocks new injection entirely: the harness
+        refuses to paste (recovery_required) rather than risk replaying it.
+        """
+        unreadable = self._journal.unreadable_records()
+        if not unreadable:
+            return None
+        return (
+            f"[{RECOVERY_ERROR_CODE}] journal holds {len(unreadable)} unreadable "
+            "record(s) that may represent an in-flight delivery; new injection is "
+            "blocked until the journal is reconciled."
+        )
+
+    def _mark_failed_safe(self, delivery_id: str, reason: str) -> None:
+        """Persist a failed transition without letting its fsync escape raw.
+
+        A DurabilityError while writing the failure transition must not propagate
+        as a stack trace: the caller has already classified the outcome (safe
+        pre-mutation failure) and will emit the typed FAILED result regardless.
+        """
+        try:
+            self._journal.mark_failed(delivery_id, reason=reason)
+        except DurabilityError as exc:
+            _logger.error(
+                "amp-native delivery %s failed and the failure transition could "
+                "not be persisted: %s",
+                delivery_id,
+                exc,
+            )
+
+    def _mark_recovery_safe(self, delivery_id: str, reason: str) -> None:
+        """Persist a recovery transition without letting its fsync escape raw.
+
+        A DurabilityError while writing the recovery transition must not
+        propagate: the caller has already classified the outcome
+        (post-mutation, replayable) and will emit the typed RECOVERY result.
+        """
+        try:
+            self._journal.mark_recovery_required(delivery_id, reason=reason)
+        except DurabilityError as exc:
+            _logger.error(
+                "amp-native delivery %s needs recovery and the recovery "
+                "transition could not be persisted: %s",
+                delivery_id,
+                exc,
+            )
 
     def _recovery_record_for(self, text: str) -> str | None:
         """Return the delivery_id of the most recent recovery record matching text.
@@ -129,6 +187,9 @@ class AmpNativeExecutor(Executor):
         text = _content_to_text(content)
         if not text:
             return LiveQueueResult(accepted=False, reason="empty message")
+        blocked = self._unreadable_block_reason()
+        if blocked is not None:
+            return LiveQueueResult(accepted=False, reason=blocked)
         recovery_id = self._recovery_record_for(text)
         if recovery_id is not None:
             return LiveQueueResult(
@@ -150,7 +211,7 @@ class AmpNativeExecutor(Executor):
             )
         except InjectionPreconditionError as exc:
             # No byte reached Amp: safe to mark failed and let a retry proceed.
-            self._journal.mark_failed(record.delivery_id, reason=str(exc))
+            self._mark_failed_safe(record.delivery_id, reason=str(exc))
             return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
         except DurabilityError as exc:
             # A durable write (create or submission_started) failed before any
@@ -158,11 +219,11 @@ class AmpNativeExecutor(Executor):
             # record may not exist (create failed) or may be pending (the
             # submission_started fsync failed), so mark_failed only when it does.
             if record is not None:
-                self._journal.mark_failed(record.delivery_id, reason=str(exc))
+                self._mark_failed_safe(record.delivery_id, reason=str(exc))
             return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
         except RuntimeError as exc:
             # A mutation may have reached Amp: never ``failed`` (replayable).
-            self._journal.mark_recovery_required(record.delivery_id, reason=str(exc))
+            self._mark_recovery_safe(record.delivery_id, reason=str(exc))
             return LiveQueueResult(
                 accepted=False,
                 reason=(
@@ -191,6 +252,10 @@ class AmpNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Amp native turn had no user text to send")
             return
+        blocked = self._unreadable_block_reason()
+        if blocked is not None:
+            yield ExecutorError(message=blocked)
+            return
         # A retry of an interrupted delivery must surface an actionable, typed
         # result and never be automatically resubmitted.
         recovery_id = self._recovery_record_for(text)
@@ -217,7 +282,7 @@ class AmpNativeExecutor(Executor):
         except InjectionPreconditionError as exc:
             # Pre-paste failure: no byte could have reached Amp, so the record
             # may safely become ``failed`` (a retry can create a new delivery).
-            self._journal.mark_failed(record.delivery_id, reason=str(exc))
+            self._mark_failed_safe(record.delivery_id, reason=str(exc))
             yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
             return
         except DurabilityError as exc:
@@ -225,13 +290,13 @@ class AmpNativeExecutor(Executor):
             # pre-mutation failure. The record may not exist (create failed),
             # so only mark_failed when it was persisted.
             if record is not None:
-                self._journal.mark_failed(record.delivery_id, reason=str(exc))
+                self._mark_failed_safe(record.delivery_id, reason=str(exc))
             yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
             return
         except RuntimeError as exc:
             # Post-mutation failure: Amp may have received the prompt, so this
             # must become ``recovery_required`` — never ``failed`` (replayable).
-            self._journal.mark_recovery_required(record.delivery_id, reason=str(exc))
+            self._mark_recovery_safe(record.delivery_id, reason=str(exc))
             yield ExecutorError(
                 message=(
                     f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
