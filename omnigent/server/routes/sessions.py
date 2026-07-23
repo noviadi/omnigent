@@ -57,6 +57,9 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent._wrapper_labels import AMP_NATIVE_WRAPPER_VALUE, WRAPPER_LABEL_KEY
+from omnigent.amp_native_bridge import bridge_dir_for_session_id
+from omnigent.amp_native_delivery import DeliveryJournal
 from omnigent.codex_native_elicitation import codex_elicitation_id
 from omnigent.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -5336,6 +5339,52 @@ async def _persist_external_codex_subagent_start(
     )
 
 
+def _is_amp_native_session(conv: Conversation) -> bool:
+    """Return whether a conversation is backed by the native Amp terminal."""
+    return conv.labels.get(WRAPPER_LABEL_KEY) == AMP_NATIVE_WRAPPER_VALUE
+
+
+def _find_existing_user_item_id_by_response_id(
+    conversation_store: ConversationStore, session_id: str, response_id: str
+) -> str | None:
+    """Return the durable id of a stored user message for ``response_id``.
+
+    Used to recover a tentative dedupe marker left by a crash mid-append: if
+    the prior attempt actually persisted, return its id; otherwise the caller
+    re-acquires the claim and appends.
+    """
+    page = conversation_store.list_items(session_id, type="message", order="desc", limit=200)
+    for stored in page.data:
+        data = getattr(stored, "data", None)
+        if (
+            getattr(data, "role", None) == "user"
+            and not getattr(data, "is_meta", False)
+            and getattr(stored, "response_id", None) == response_id
+        ):
+            return getattr(stored, "id", None)
+    return None
+
+
+def _confirm_amp_native_delivery(
+    session_id: str, response_id: str, expected_thread_id: str | None, item_id: str
+) -> None:
+    """Confirm the outstanding amp-native delivery for a mirrored user item.
+
+    Correlates the plugin mirror (``response_id`` from the matching
+    ``agent.start``) with the one ``submission_started`` delivery and stamps the
+    durable item id. Best-effort: confirmation failure never blocks persisting
+    the transcript item, but is logged so the delivery can be reconciled.
+    """
+    try:
+        DeliveryJournal(bridge_dir_for_session_id(session_id)).confirm_outstanding(
+            response_id=response_id,
+            expected_thread_id=expected_thread_id,
+            confirmed_item_id=item_id,
+        )
+    except OSError:
+        _logger.warning("amp-native delivery confirmation failed for session %s", session_id)
+
+
 async def _persist_external_conversation_item(
     session_id: str,
     conv: Conversation,
@@ -5365,72 +5414,122 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
-    # Set-once dedupe for browser-prompt user messages. The plugin's
-    # ``response_id`` is derived from the Amp ``agent.start`` of the matching
-    # thread, so it is stable across plugin retries. A retried post must NOT
-    # append a second durable item NOR drain the next optimistic pending-input
-    # entry (the FIFO drain would otherwise misbind the retried prompt to a
-    # different browser message). See :mod:`omnigent.runtime.external_item_dedupe`.
-    if (
-        item.type == "message"
+    is_amp_user_mirror = (
+        _is_amp_native_session(conv)
+        and item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
         and not item.data.is_meta
-        and item.response_id
-        and not external_item_dedupe.claim(session_id, item.response_id)
-    ):
-        return item.response_id
-    # A native user message round-tripping back from the transcript:
-    # drain its optimistic pending-input entry (FIFO) and fold the
-    # entry's file blocks (image / file) into the item BEFORE persisting.
-    # The transcript is text-only, so without this the image is dropped
-    # from durable history and disappears on every reload / navigation.
-    cleared_pending_id: str | None = None
-    skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
-    if (
-        item.type == "message"
-        and isinstance(item.data, MessageData)
-        and item.data.role == "user"
-        and not item.data.is_meta
-    ):
-        if _is_kiro_native_session(conv):
-            text = _message_text(item.data.content) or ""
-            matched = pending_inputs.resolve_matching_text(session_id, text)
-            drained = matched.matched
-            skipped_kiro_pending = matched.skipped
-        else:
-            drained = pending_inputs.resolve_oldest(session_id)
-        if drained is not None:
-            cleared_pending_id = drained.pending_id
-            item = _merge_pending_file_blocks(item, drained.content)
-            # Apply the original sender's identity recorded at POST time.
-            # The transcript forwarder is the single writer here and has no
-            # auth context, so the persisted item would otherwise have
-            # created_by=None, causing session.input.consumed to broadcast
-            # without an author — the label would flash in from the optimistic
-            # bubble then disappear once the committed item arrived.
-            if drained.created_by is not None and item.created_by is None:
-                item = item.model_copy(update={"created_by": drained.created_by})
-        elif item.created_by is None and created_by is not None:
-            # No pending entry — direct terminal input. Fall back to the
-            # identity authenticated on the forwarder's own request.
-            item = item.model_copy(update={"created_by": created_by})
-    for skipped in skipped_kiro_pending:
-        await _persist_skipped_kiro_pending_input(
-            session_id,
-            skipped,
-            conversation_store,
-        )
-    pending_background_title = prepare_background_session_title(
-        coordinator=background_title_coordinator,
-        conversation=conv,
-        event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        and bool(item.response_id)
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, [item])
+    # Durable, cross-process set-once dedupe for amp-native browser-prompt
+    # mirrors. The plugin ``response_id`` (from the matching ``agent.start``)
+    # is stable across retries, so it keys the claim. The marker is committed
+    # with the durable item id only AFTER a successful append, so a retried post
+    # cannot duplicate the item and a crashed-mid-append attempt is recovered
+    # against the store rather than silently dropped. See
+    # :mod:`omnigent.runtime.external_item_dedupe`. Non-amp routes are
+    # untouched (dedupe is gated on the wrapper label).
+    dedupe_response_id: str | None = None
+    # The per-session lock makes acquire→drain→append→commit atomic in-process
+    # so two concurrent posts for the same response_id cannot both append. The
+    # durable marker (O_EXCL) provides the cross-process guarantee.
+    dedupe_lock = (
+        external_item_dedupe.async_lock(session_id)
+        if is_amp_user_mirror
+        else contextlib.nullcontext()
+    )
+    async with dedupe_lock:
+        if is_amp_user_mirror:
+            response_id = item.response_id or ""
+            decision = external_item_dedupe.acquire(session_id, response_id)
+            if not decision.persist and decision.existing_item_id is not None:
+                return decision.existing_item_id
+            if not decision.persist:
+                # Tentative marker from a crash mid-append: reconcile against
+                # the durable store before deciding.
+                existing = await asyncio.to_thread(
+                    _find_existing_user_item_id_by_response_id,
+                    conversation_store,
+                    session_id,
+                    response_id,
+                )
+                decision = external_item_dedupe.recover_tentative(
+                    session_id, response_id, existing
+                )
+                if not decision.persist:
+                    return decision.existing_item_id
+            dedupe_response_id = response_id
+        # A native user message round-tripping back from the transcript:
+        # drain its optimistic pending-input entry (FIFO) and fold the
+        # entry's file blocks (image / file) into the item BEFORE persisting.
+        # The transcript is text-only, so without this the image is dropped
+        # from durable history and disappears on every reload / navigation.
+        cleared_pending_id: str | None = None
+        skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
+        if (
+            item.type == "message"
+            and isinstance(item.data, MessageData)
+            and item.data.role == "user"
+            and not item.data.is_meta
+        ):
+            if _is_kiro_native_session(conv):
+                text = _message_text(item.data.content) or ""
+                matched = pending_inputs.resolve_matching_text(session_id, text)
+                drained = matched.matched
+                skipped_kiro_pending = matched.skipped
+            else:
+                drained = pending_inputs.resolve_oldest(session_id)
+            if drained is not None:
+                cleared_pending_id = drained.pending_id
+                item = _merge_pending_file_blocks(item, drained.content)
+                # Apply the original sender's identity recorded at POST time.
+                # The transcript forwarder is the single writer here and has no
+                # auth context, so the persisted item would otherwise have
+                # created_by=None, causing session.input.consumed to broadcast
+                # without an author — the label would flash in from the
+                # optimistic bubble then disappear once the committed item
+                # arrived.
+                if drained.created_by is not None and item.created_by is None:
+                    item = item.model_copy(update={"created_by": drained.created_by})
+            elif item.created_by is None and created_by is not None:
+                # No pending entry — direct terminal input. Fall back to the
+                # identity authenticated on the forwarder's own request.
+                item = item.model_copy(update={"created_by": created_by})
+        for skipped in skipped_kiro_pending:
+            await _persist_skipped_kiro_pending_input(
+                session_id,
+                skipped,
+                conversation_store,
+            )
+        pending_background_title = prepare_background_session_title(
+            coordinator=background_title_coordinator,
+            conversation=conv,
+            event=SessionEventInput(type=item.type, data=item.data.model_dump()),
+        )
+        try:
+            persisted_items = await asyncio.to_thread(
+                conversation_store.append, session_id, [item]
+            )
+        except Exception:
+            # Append failed before persistence: release the claim so a retry
+            # is not silently dropped.
+            if dedupe_response_id is not None:
+                external_item_dedupe.release(session_id, dedupe_response_id)
+            raise
+        persisted = persisted_items[0]
+        if dedupe_response_id is not None:
+            external_item_dedupe.commit(session_id, dedupe_response_id, persisted.id)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
-    persisted = persisted_items[0]
+    if dedupe_response_id is not None:
+        _confirm_amp_native_delivery(
+            session_id,
+            dedupe_response_id,
+            getattr(conv, "external_session_id", None),
+            persisted.id,
+        )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id
     )
