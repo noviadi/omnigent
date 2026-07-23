@@ -51,6 +51,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LiveQueueResult,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -606,6 +607,25 @@ class ExecutorAdapter(HarnessApp):
                     "not see the steered message until the next turn",
                     f" ({reason})" if reason else "",
                 )
+                # A typed refusal (e.g. an amp-native delivery that needs
+                # recovery) is actionable: surface it on the session event
+                # stream like the turn path, not only in logs, so the UI can
+                # report it instead of silently dropping the message.
+                if isinstance(accepted, LiveQueueResult) and reason:
+                    ctx.emit(
+                        OutputItemDoneEvent(
+                            type="response.output_item.done",
+                            item={
+                                "id": f"{ctx.response_id}_injection_refused",
+                                "type": "message",
+                                "role": "assistant",
+                                "status": "completed",
+                                "content": [
+                                    {"type": "output_text", "text": reason, "annotations": []}
+                                ],
+                            },
+                        )
+                    )
                 continue
             # The executor consumed this injection into the running turn.
             # Echo the runner's correlation id back as an

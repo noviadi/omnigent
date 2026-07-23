@@ -17,7 +17,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
-from omnigent.amp_native_delivery import DeliveryJournal, canonical_prompt
+from omnigent.amp_native_delivery import DeliveryJournal, DeliveryState, canonical_prompt
 
 AMP_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_AMP_NATIVE_BRIDGE_DIR"
 AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_AMP_NATIVE_REQUEST_SESSION_ID"
@@ -190,8 +190,15 @@ def inject_user_message(
             payload.extend(character.encode("utf-8"))
 
     # Durable submission marker BEFORE any paste/Enter byte can reach Amp.
-    # fsync failure here must fail closed — do not proceed to paste.
-    journal.mark_submission_started(delivery_id)
+    # The transition must actually succeed: a record that is missing or already
+    # terminal (confirmed/recovery_required/failed) means the durable state does
+    # not authorize injection, so abort before any tmux mutation rather than
+    # pasting against an untracked or already-resolved delivery.
+    started = journal.mark_submission_started(delivery_id)
+    if started is None or started.state != DeliveryState.SUBMISSION_STARTED.value:
+        raise InjectionPreconditionError(
+            f"delivery {delivery_id} is not in a submittable state; aborting before paste"
+        )
     if hooks is not None and hooks.before_paste is not None:
         hooks.before_paste()
     with tempfile.NamedTemporaryFile(dir=path, prefix="paste_", delete=False) as paste:

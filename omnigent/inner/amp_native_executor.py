@@ -26,7 +26,12 @@ from omnigent.amp_native_bridge import (
     InjectionPreconditionError,
     inject_user_message,
 )
-from omnigent.amp_native_delivery import DeliveryJournal, DeliveryState
+from omnigent.amp_native_delivery import (
+    DeliveryJournal,
+    DeliveryRecord,
+    DeliveryState,
+    DurabilityError,
+)
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -133,8 +138,9 @@ class AmpNativeExecutor(Executor):
                     "before confirmation; resubmission is blocked."
                 ),
             )
-        record = self._journal.create(content=text, conversation_id=self._conversation_id)
+        record: DeliveryRecord | None = None
         try:
+            record = self._journal.create(content=text, conversation_id=self._conversation_id)
             await asyncio.to_thread(
                 inject_user_message,
                 self._bridge_dir,
@@ -145,6 +151,14 @@ class AmpNativeExecutor(Executor):
         except InjectionPreconditionError as exc:
             # No byte reached Amp: safe to mark failed and let a retry proceed.
             self._journal.mark_failed(record.delivery_id, reason=str(exc))
+            return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
+        except DurabilityError as exc:
+            # A durable write (create or submission_started) failed before any
+            # byte could reach Amp: treat as a safe pre-mutation failure. The
+            # record may not exist (create failed) or may be pending (the
+            # submission_started fsync failed), so mark_failed only when it does.
+            if record is not None:
+                self._journal.mark_failed(record.delivery_id, reason=str(exc))
             return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
         except RuntimeError as exc:
             # A mutation may have reached Amp: never ``failed`` (replayable).
@@ -189,8 +203,9 @@ class AmpNativeExecutor(Executor):
                 )
             )
             return
-        record = self._journal.create(content=text, conversation_id=self._conversation_id)
+        record: DeliveryRecord | None = None
         try:
+            record = self._journal.create(content=text, conversation_id=self._conversation_id)
             await asyncio.to_thread(
                 inject_user_message,
                 self._bridge_dir,
@@ -203,6 +218,14 @@ class AmpNativeExecutor(Executor):
             # Pre-paste failure: no byte could have reached Amp, so the record
             # may safely become ``failed`` (a retry can create a new delivery).
             self._journal.mark_failed(record.delivery_id, reason=str(exc))
+            yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
+            return
+        except DurabilityError as exc:
+            # A durable write failed before any byte could reach Amp: a safe
+            # pre-mutation failure. The record may not exist (create failed),
+            # so only mark_failed when it was persisted.
+            if record is not None:
+                self._journal.mark_failed(record.delivery_id, reason=str(exc))
             yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
             return
         except RuntimeError as exc:

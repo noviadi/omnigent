@@ -18,7 +18,11 @@ from pathlib import Path
 import pytest
 
 from omnigent import amp_native_bridge
-from omnigent.amp_native_bridge import InjectionHooks, inject_user_message
+from omnigent.amp_native_bridge import (
+    InjectionHooks,
+    InjectionPreconditionError,
+    inject_user_message,
+)
 from omnigent.amp_native_delivery import (
     SCHEMA_VERSION,
     DeliveryJournal,
@@ -383,15 +387,18 @@ def test_concurrent_confirm_and_reconcile_do_not_clobber(tmp_path: Path) -> None
 def test_fsync_failure_is_fail_closed_no_paste(
     fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If directory fsync cannot establish durability, injection does not paste."""
+    """A raw fsync OSError is classified as a typed DurabilityError and the
+    injection does not paste."""
+    from omnigent.amp_native_delivery import DurabilityError
+
     journal = DeliveryJournal(fake_tmux.bridge)
     record = journal.create(content="durable?", conversation_id="conv_1")
 
-    def _raise() -> None:
+    def _boom_fsync(_fd: int) -> None:
         raise OSError("simulated fsync failure")
 
-    monkeypatch.setattr(journal, "_fsync_dir", _raise)
-    with pytest.raises(OSError, match="simulated fsync failure"):
+    monkeypatch.setattr("omnigent.amp_native_delivery.os.fsync", _boom_fsync)
+    with pytest.raises(DurabilityError, match="simulated fsync failure"):
         inject_user_message(
             fake_tmux.bridge,
             "durable?",
@@ -427,9 +434,18 @@ def test_clear_inbox_does_not_wipe_delivery_state(tmp_path: Path) -> None:
 def test_runner_recreate_reconciles_and_publishes_recovery(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The recreate lifecycle reconciles the journal and surfaces recovery."""
+    """The real recreate lifecycle reconciles the journal and surfaces recovery.
+
+    Exercises ``_auto_create_amp_terminal`` itself (with the terminal-launch
+    collaborators faked) rather than mirroring its reconcile loop, so the
+    reconcile + publish wiring is covered by the production code path.
+    """
+    import omnigent.amp_native as amp_native_mod
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as runner_entry
+    import omnigent.runner.app as runner_app
+
     bridge = tmp_path / "bridge"
-    bridge.mkdir()
     monkeypatch.setattr(amp_native_bridge, "bridge_dir_for_session_id", lambda _sid: bridge)
     journal = DeliveryJournal(bridge)
     journal.create(content="left mid-flight", conversation_id="conv_1")
@@ -440,20 +456,44 @@ def test_runner_recreate_reconciles_and_publishes_recovery(
     def _publish(_sid: str, event: dict[str, object]) -> None:
         published.append(event)
 
-    # Mirror the recreate reconcile step from _auto_create_amp_terminal.
-    for recovered in DeliveryJournal(
-        amp_native_bridge.bridge_dir_for_session_id("conv_1")
-    ).reconcile_on_start():
-        _publish(
-            "conv_1",
-            {
-                "type": "amp_native_delivery_recovery",
-                "delivery_id": recovered.delivery_id,
-                "reason": recovered.reason,
-            },
+    async def _fake_launch_config(*, session_id: str, server_client: object):
+        del session_id, server_client
+        return types.SimpleNamespace(
+            server_url="http://server",
+            external_session_id="T-1",
+            workspace=tmp_path,
+            terminal_launch_args=[],
         )
-    assert len(published) == 1
-    assert published[0]["type"] == "amp_native_delivery_recovery"
+
+    monkeypatch.setattr(runner_app, "_pi_native_launch_config", _fake_launch_config)
+    monkeypatch.setattr(runner_app, "_agent_os_env_from_spec", lambda spec: None)
+    monkeypatch.setattr(runner_app, "session_resource_view_to_dict", lambda view: {})
+    monkeypatch.setattr(runner_entry, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        amp_native_bridge,
+        "install_plugin_and_config",
+        lambda *a, **k: (tmp_path / "p.ts", tmp_path / "c.json"),
+    )
+    monkeypatch.setattr(amp_native_mod, "build_amp_launch", lambda *a, **k: ["amp"])
+    monkeypatch.setattr(cli_auth, "databricks_request_headers", lambda *a, **k: {})
+
+    async def _launch_terminal(**kwargs: object) -> object:
+        return types.SimpleNamespace()
+
+    resource_registry = types.SimpleNamespace(
+        launch_required_terminal=_launch_terminal,
+        terminal_registry=None,
+    )
+
+    asyncio.run(
+        runner_app._auto_create_amp_terminal(
+            "conv_1",
+            resource_registry,  # type: ignore[arg-type]
+            _publish,
+            server_client=object(),
+        )
+    )
+    assert any(e.get("type") == "amp_native_delivery_recovery" for e in published)
     assert journal.load_all()[0].state == DeliveryState.RECOVERY_REQUIRED.value
 
 
@@ -464,49 +504,101 @@ def test_runner_recreate_reconciles_and_publishes_recovery(
 
 @pytest.fixture
 def isolated_dedupe(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Redirect the dedupe marker root to a tmp bridge and reset in-process locks."""
+    """Redirect the dedupe marker root to a tmp bridge."""
     bridge = tmp_path / "dedupe_bridge"
     monkeypatch.setattr(external_item_dedupe, "bridge_dir_for_session_id", lambda _sid: bridge)
     external_item_dedupe.reset_for_tests()
     return bridge
 
 
-def test_dedupe_marker_is_durable_set_once(isolated_dedupe: Path) -> None:
-    decision = external_item_dedupe.acquire("conv_1", "T-1:ev_42")
-    assert decision.persist is True
-    # A repeat acquire for the same key is refused (no existing id yet = tentative).
-    again = external_item_dedupe.acquire("conv_1", "T-1:ev_42")
-    assert again.persist is False
-    assert again.existing_item_id is None
-    # After committing the item id, a repeat returns the durable item.
-    external_item_dedupe.commit("conv_1", "T-1:ev_42", "item_7")
+def test_dedupe_claim_is_durable_set_once(isolated_dedupe: Path) -> None:
+    """The first claim owns the key; a concurrent/second claim sees nothing yet,
+    and after commit a later claim returns the durable item id."""
+    claim = external_item_dedupe.Claim("conv_1", "T-1:ev_42")
+    view = claim.enter()
+    assert view.duplicate is False
+    assert view.orphan is False
+    claim.commit("item_7")
+    claim.close()
     assert external_item_dedupe.is_claimed("conv_1", "T-1:ev_42") is True
-    duplicate = external_item_dedupe.acquire("conv_1", "T-1:ev_42")
-    assert duplicate.persist is False
-    assert duplicate.existing_item_id == "item_7"
+    later = external_item_dedupe.Claim("conv_1", "T-1:ev_42")
+    later_view = later.enter()
+    assert later_view.duplicate is True
+    assert later_view.item_id == "item_7"
+    later.close()
 
 
-def test_dedupe_release_lets_retry_proceed(isolated_dedupe: Path) -> None:
-    """A failed-before-persistence claim is released so a retry can re-acquire."""
-    external_item_dedupe.acquire("conv_1", "T-1:ev_9")
-    external_item_dedupe.release("conv_1", "T-1:ev_9")
-    decision = external_item_dedupe.acquire("conv_1", "T-1:ev_9")
-    assert decision.persist is True
+def test_dedupe_claim_abort_lets_retry_proceed(isolated_dedupe: Path) -> None:
+    """An owner that aborts its failed tentative claim lets a retry re-acquire."""
+    claim = external_item_dedupe.Claim("conv_1", "T-1:ev_9")
+    claim.enter()
+    claim.abort()
+    claim.close()
+    again = external_item_dedupe.Claim("conv_1", "T-1:ev_9")
+    view = again.enter()
+    assert view.duplicate is False
+    assert view.orphan is False
+    again.close()
 
 
-def test_dedupe_recovers_tentative_against_store(isolated_dedupe: Path) -> None:
-    """A tentative (crashed-mid-append) marker is reconciled with the store."""
-    external_item_dedupe.acquire("conv_1", "T-1:ev_5")  # leaves empty marker
-    # Prior attempt actually persisted -> recover fills the marker and skips.
-    skip = external_item_dedupe.recover_tentative("conv_1", "T-1:ev_5", "item_3")
-    assert skip.persist is False
-    assert skip.existing_item_id == "item_3"
+def test_dedupe_claim_recovers_orphan_against_store(isolated_dedupe: Path) -> None:
+    """A tentative marker left by a crashed prior attempt is recovered via the
+    store: if the item exists the orphan is promoted to committed."""
+    marker_path = external_item_dedupe._marker_path("conv_1", "T-1:ev_5")
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    # Simulate a crash mid-append: a tentative marker with no item id.
+    external_item_dedupe._write_marker(marker_path, {})
+    claim = external_item_dedupe.Claim("conv_1", "T-1:ev_5")
+    view = claim.enter()
+    assert view.duplicate is False
+    assert view.orphan is True
+    # The store confirms the prior attempt did persist -> commit + duplicate.
+    claim.commit("item_3")
+    claim.close()
+    assert external_item_dedupe.is_claimed("conv_1", "T-1:ev_5") is True
 
-    external_item_dedupe.release("conv_1", "T-1:ev_5")
-    external_item_dedupe.acquire("conv_1", "T-1:ev_5")  # tentative again
-    # Prior attempt persisted nothing -> recover releases and re-acquires.
-    redo = external_item_dedupe.recover_tentative("conv_1", "T-1:ev_5", None)
-    assert redo.persist is True
+
+def test_dedupe_claim_serializes_concurrent_append(isolated_dedupe: Path) -> None:
+    """Two threads racing acquire->append->commit for the same key cannot both
+    append: the cross-process flock makes the second block until the first
+    commits, after which it sees the durable duplicate (no active claim is ever
+    deleted by a concurrent caller)."""
+    import threading
+
+    barrier = threading.Barrier(2)
+    appended: list[str] = []
+    results: list[external_item_dedupe.ClaimView] = []
+    errors: list[BaseException] = []
+
+    def _worker(item_id: str) -> None:
+        try:
+            claim = external_item_dedupe.Claim("conv_1", "T-1:ev_race")
+            barrier.wait(timeout=5.0)
+            view = claim.enter()
+            if not view.duplicate:
+                # Hold the critical section briefly so the other thread must
+                # block on the flock rather than slipping in.
+                threading.Event().wait(0.05)
+                appended.append(item_id)
+                claim.commit(item_id)
+            else:
+                results.append(view)
+            claim.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_worker, args=("item_a",))
+    t2 = threading.Thread(target=_worker, args=("item_b",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10.0)
+    t2.join(timeout=10.0)
+    assert errors == []
+    # Exactly one append happened; the other claim saw the committed duplicate.
+    assert len(appended) == 1
+    assert len(results) == 1
+    assert results[0].duplicate is True
+    assert results[0].item_id == appended[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -664,3 +756,206 @@ async def _first_event_name(executor: AmpNativeExecutor, messages: list[dict]) -
     async for event in executor.run_turn(messages, [], ""):
         return type(event).__name__
     return "none"
+
+
+# --------------------------------------------------------------------------- #
+# Second-review hardening: late confirm after recovery, verified pre-paste
+# transition, typed durability failures, schema validation, live-queue surfacing
+# --------------------------------------------------------------------------- #
+
+
+def test_late_confirmation_after_reconcile_resolves_recovery(tmp_path: Path) -> None:
+    """A plugin confirmation arriving after a recreate reconcile moved the
+    delivery to recovery_required still resolves it (idempotent, no double
+    confirm)."""
+    journal = DeliveryJournal(tmp_path / "bridge")
+    record = journal.create(content="raced the recreate", conversation_id="conv_1")
+    journal.mark_submission_started(record.delivery_id)
+    # Restart reconcile races the mirror and moves the record to recovery.
+    journal.reconcile_on_start()
+    assert journal.get(record.delivery_id).state == DeliveryState.RECOVERY_REQUIRED.value
+
+    # The late mirror (first confirmation for this response_id) still confirms
+    # via content correlation, stamping response_id + the durable item id.
+    outcome = journal.confirm_outstanding(
+        response_id="T-1:ev_42",
+        expected_thread_id="T-1",
+        confirmed_item_id="item_9",
+        content="raced the recreate",
+    )
+    assert outcome.confirmed is True
+    reloaded = journal.get(record.delivery_id)
+    assert reloaded.state == DeliveryState.CONFIRMED.value
+    assert reloaded.response_id == "T-1:ev_42"
+    assert reloaded.confirmed_item_id == "item_9"
+
+    # A duplicate mirror does not re-confirm (already terminal).
+    again = journal.confirm_outstanding(
+        response_id="T-1:ev_42",
+        expected_thread_id="T-1",
+        confirmed_item_id="item_9",
+        content="raced the recreate",
+    )
+    assert again.confirmed is False
+    assert again.already_confirmed is True
+
+
+def test_persist_confirms_delivery_even_on_duplicate_mirror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A duplicate mirror still retries the (idempotent) confirmation so a
+    delivery whose confirm step crashed after the dedupe marker committed can
+    be resolved by a later post."""
+    import omnigent.server.routes.sessions as server_routes
+
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(server_routes, "bridge_dir_for_session_id", lambda _sid: bridge)
+    monkeypatch.setattr(external_item_dedupe, "bridge_dir_for_session_id", lambda _sid: bridge)
+    external_item_dedupe.reset_for_tests()
+    _patch_server_neutrals(monkeypatch)
+
+    journal = DeliveryJournal(bridge)
+    record = journal.create(content="hello", conversation_id="conv_1")
+    journal.mark_submission_started(record.delivery_id)
+
+    conv = types.SimpleNamespace(
+        labels={"omnigent.wrapper": "amp-native-ui"},
+        external_session_id="T-1",
+        title=None,
+    )
+    body = _user_mirror_body("T-1:ev_42", "hello")
+
+    # First mirror appends but simulate the confirm step being lost: drop the
+    # confirmed marker back to recovery_required so the delivery is unresolved.
+    first = asyncio.run(
+        server_routes._persist_external_conversation_item(
+            "conv_1",
+            conv,
+            body,
+            _FakeStore(),  # type: ignore[arg-type]
+        )
+    )
+    assert journal.get(record.delivery_id).state == DeliveryState.CONFIRMED.value
+
+    # Force the delivery back to an unresolved state (confirm was lost).
+    import omnigent.amp_native_delivery as delivery
+
+    delivery.DeliveryJournal(bridge).mark_recovery_required(record.delivery_id)
+
+    # A duplicate mirror returns the existing item AND re-runs confirmation,
+    # resolving the recovery_required delivery to confirmed.
+    second = asyncio.run(
+        server_routes._persist_external_conversation_item(
+            "conv_1",
+            conv,
+            body,
+            _FakeStore(),  # type: ignore[arg-type]
+        )
+    )
+    assert second == first
+    assert journal.get(record.delivery_id).state == DeliveryState.CONFIRMED.value
+    external_item_dedupe.reset_for_tests()
+
+
+def test_inject_aborts_when_delivery_is_terminal_no_paste(
+    fake_tmux: _FakeTmux,
+) -> None:
+    """Injection requires a successful submission_started transition; a terminal
+    or otherwise non-submittable record aborts before any tmux mutation."""
+    journal = DeliveryJournal(fake_tmux.bridge)
+    record = journal.create(content="already resolved", conversation_id="conv_1")
+    journal.confirm(record.delivery_id, response_id="T-1:ev_1")  # terminal
+
+    with pytest.raises(InjectionPreconditionError, match="not in a submittable state"):
+        inject_user_message(
+            fake_tmux.bridge,
+            "already resolved",
+            journal=journal,
+            delivery_id=record.delivery_id,
+        )
+    assert fake_tmux.paste_calls == 0
+    assert fake_tmux.enter_calls == 0
+
+
+def test_executor_emits_typed_failed_on_durability_error(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durability failure (e.g. fsync) is classified and surfaced as a typed
+    FAILED result — no raw crash and no paste."""
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(fake_tmux.bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+
+    def _boom_fsync(_fd: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("omnigent.amp_native_delivery.os.fsync", _boom_fsync)
+    executor = AmpNativeExecutor(bridge_dir=fake_tmux.bridge)
+    messages = [{"role": "user", "content": "no disk space"}]
+
+    events = asyncio.run(_drive_turn(executor, messages))
+    assert executor_module.FAILED_ERROR_CODE in " ".join(events)
+    assert executor_module.RECOVERY_ERROR_CODE not in " ".join(events)
+    assert fake_tmux.paste_calls == 0
+    assert fake_tmux.enter_calls == 0
+
+
+def test_journal_rejects_unknown_schema_version(tmp_path: Path) -> None:
+    """A record written by an unknown/future schema version is not interpreted
+    with the current shape (returns None) rather than silently accepted."""
+    import json
+
+    journal = DeliveryJournal(tmp_path / "bridge")
+    record = journal.create(content="x", conversation_id="conv_1")
+    path = tmp_path / "bridge" / "delivery" / f"{record.delivery_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["schema_version"] = 99  # unknown future version
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert journal.get(record.delivery_id) is None
+    assert journal.load_all() == []
+
+
+def test_live_queue_refusal_surfaces_on_session_event_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typed live-queue refusal (recovery/failed) reaches the session event
+    stream via the executor adapter, not only the logs."""
+    from omnigent.inner.executor import LiveQueueResult
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class _FakeCtx:
+        def __init__(self, injections: list[object]) -> None:
+            self._injections = list(injections)
+            self.response_id = "resp_1"
+            self.cancelled = types.SimpleNamespace(is_set=lambda: False)
+            self.emitted: list[object] = []
+
+        async def next_injection(self, timeout: float | None = None) -> object:
+            del timeout
+            return self._injections.pop(0) if self._injections else None
+
+        def emit(self, event: object) -> None:
+            self.emitted.append(event)
+
+    class _FakeExecutor:
+        async def enqueue_session_message(self, session_key: str, text: str) -> object:
+            del session_key, text
+            return LiveQueueResult(
+                accepted=False,
+                reason=(
+                    f"[{executor_module.RECOVERY_ERROR_CODE}] delivery d was "
+                    "interrupted; resubmission is blocked."
+                ),
+            )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: None)
+    ctx = _FakeCtx([types.SimpleNamespace(input="steered text", injection_id=None)])
+    asyncio.run(adapter._watch_injections(ctx, _FakeExecutor()))  # type: ignore[arg-type]
+
+    refusal_events = [
+        e
+        for e in ctx.emitted
+        if getattr(e, "type", None) == "response.output_item.done"
+        and getattr(e, "item", {}).get("role") == "assistant"
+    ]
+    assert refusal_events, "expected a session-visible refusal event"
+    assert executor_module.RECOVERY_ERROR_CODE in refusal_events[0].item["content"][0]["text"]

@@ -5351,38 +5351,85 @@ def _find_existing_user_item_id_by_response_id(
 
     Used to recover a tentative dedupe marker left by a crash mid-append: if
     the prior attempt actually persisted, return its id; otherwise the caller
-    re-acquires the claim and appends.
+    appends under the claim it owns. Scans the FULL message history via cursor
+    pagination — a bounded scan would silently miss a mirrored item older than
+    the window and let a duplicate append slip through.
     """
-    page = conversation_store.list_items(session_id, type="message", order="desc", limit=200)
-    for stored in page.data:
-        data = getattr(stored, "data", None)
-        if (
-            getattr(data, "role", None) == "user"
-            and not getattr(data, "is_meta", False)
-            and getattr(stored, "response_id", None) == response_id
-        ):
-            return getattr(stored, "id", None)
+    after: str | None = None
+    while True:
+        page = conversation_store.list_items(
+            session_id, type="message", order="asc", limit=100, after=after
+        )
+        for stored in page.data:
+            data = getattr(stored, "data", None)
+            if (
+                getattr(data, "role", None) == "user"
+                and not getattr(data, "is_meta", False)
+                and getattr(stored, "response_id", None) == response_id
+            ):
+                return getattr(stored, "id", None)
+        if not getattr(page, "has_more", False) or not page.data:
+            break
+        after = getattr(page, "last_id", None)
+        if after is None:
+            break
     return None
 
 
 def _confirm_amp_native_delivery(
-    session_id: str, response_id: str, expected_thread_id: str | None, item_id: str
+    session_id: str,
+    response_id: str,
+    expected_thread_id: str | None,
+    item_id: str,
+    content: str | None = None,
 ) -> None:
     """Confirm the outstanding amp-native delivery for a mirrored user item.
 
     Correlates the plugin mirror (``response_id`` from the matching
-    ``agent.start``) with the one ``submission_started`` delivery and stamps the
-    durable item id. Best-effort: confirmation failure never blocks persisting
-    the transcript item, but is logged so the delivery can be reconciled.
+    ``agent.start``) with the matching delivery — which may still be
+    ``submission_started`` OR already ``recovery_required`` if a recreate
+    reconcile moved it before this mirror arrived — and stamps the durable item
+    id. Best-effort and idempotent: a duplicate mirror re-runs this and is a
+    no-op once confirmed, but it still retries the confirmation so a committed
+    dedupe marker whose confirm step crashed can land on a later post.
+    Confirmation failure never blocks persisting the transcript item.
     """
     try:
         DeliveryJournal(bridge_dir_for_session_id(session_id)).confirm_outstanding(
             response_id=response_id,
             expected_thread_id=expected_thread_id,
             confirmed_item_id=item_id,
+            content=content,
         )
     except OSError:
         _logger.warning("amp-native delivery confirmation failed for session %s", session_id)
+
+
+async def _close_dedupe_claim(
+    claim: external_item_dedupe.Claim | None,
+) -> external_item_dedupe.Claim | None:
+    """Release a dedupe claim's flock and return None (nothing more to close)."""
+    if claim is None:
+        return None
+    await asyncio.to_thread(claim.close)
+    return None
+
+
+async def _abort_and_close_dedupe_claim(
+    claim: external_item_dedupe.Claim | None,
+) -> external_item_dedupe.Claim | None:
+    """Abort an owner's failed tentative claim, then close it.
+
+    Only called by the claim owner (which holds the flock) on an append
+    failure, so the tentative marker it removes is its own — a concurrent
+    caller is blocked on the flock and never reaches here.
+    """
+    if claim is None:
+        return None
+    with contextlib.suppress(OSError):
+        await asyncio.to_thread(claim.abort)
+    await asyncio.to_thread(claim.close)
+    return None
 
 
 async def _persist_external_conversation_item(
@@ -5424,42 +5471,61 @@ async def _persist_external_conversation_item(
     )
     # Durable, cross-process set-once dedupe for amp-native browser-prompt
     # mirrors. The plugin ``response_id`` (from the matching ``agent.start``)
-    # is stable across retries, so it keys the claim. The marker is committed
-    # with the durable item id only AFTER a successful append, so a retried post
-    # cannot duplicate the item and a crashed-mid-append attempt is recovered
-    # against the store rather than silently dropped. See
+    # is stable across retries, so it keys the claim. A cross-process flock
+    # serializes the whole enter→(store-recovery)→drain→append→commit critical
+    # section for one key, so a concurrent post can NEVER interleave with an
+    # in-flight append: it blocks on the flock until the first commits or
+    # aborts. The marker is committed with the durable item id only AFTER a
+    # successful append, and a tentative marker from a crashed-mid-append
+    # attempt is recovered against the store. See
     # :mod:`omnigent.runtime.external_item_dedupe`. Non-amp routes are
     # untouched (dedupe is gated on the wrapper label).
     dedupe_response_id: str | None = None
-    # The per-session lock makes acquire→drain→append→commit atomic in-process
-    # so two concurrent posts for the same response_id cannot both append. The
-    # durable marker (O_EXCL) provides the cross-process guarantee.
-    dedupe_lock = (
-        external_item_dedupe.async_lock(session_id)
-        if is_amp_user_mirror
-        else contextlib.nullcontext()
+    dedupe_claim: external_item_dedupe.Claim | None = None
+    dedupe_existing_item_id: str | None = None
+    # Mirror text (for delivery confirmation correlation) when available.
+    mirror_content: str | None = (
+        _message_text(item.data.content) if isinstance(item.data, MessageData) else None
     )
-    async with dedupe_lock:
+    try:
         if is_amp_user_mirror:
             response_id = item.response_id or ""
-            decision = external_item_dedupe.acquire(session_id, response_id)
-            if not decision.persist and decision.existing_item_id is not None:
-                return decision.existing_item_id
-            if not decision.persist:
-                # Tentative marker from a crash mid-append: reconcile against
-                # the durable store before deciding.
+            dedupe_response_id = response_id
+            dedupe_claim = external_item_dedupe.Claim(session_id, response_id)
+            # enter() blocks on the cross-process flock inside a worker thread
+            # so the event loop is not stalled; the flock stays held (lock fd
+            # open) across the awaited drain/append below until close().
+            view = await asyncio.to_thread(dedupe_claim.enter)
+            if view.duplicate:
+                # A committed item already exists for this key. Retry the
+                # (idempotent) confirmation so a prior confirm that crashed
+                # after the marker committed can land here, then return the
+                # existing id without re-appending or re-publishing.
+                dedupe_existing_item_id = view.item_id
+                dedupe_claim = await _close_dedupe_claim(dedupe_claim)
+            elif view.orphan:
+                # Tentative marker from a crashed prior attempt: reconcile
+                # against the full durable store before deciding.
                 existing = await asyncio.to_thread(
                     _find_existing_user_item_id_by_response_id,
                     conversation_store,
                     session_id,
                     response_id,
                 )
-                decision = external_item_dedupe.recover_tentative(
-                    session_id, response_id, existing
-                )
-                if not decision.persist:
-                    return decision.existing_item_id
-            dedupe_response_id = response_id
+                if existing is not None:
+                    await asyncio.to_thread(dedupe_claim.commit, existing)
+                    dedupe_existing_item_id = existing
+                    dedupe_claim = await _close_dedupe_claim(dedupe_claim)
+            # else: this caller owns the claim and appends below.
+        if dedupe_existing_item_id is not None:
+            _confirm_amp_native_delivery(
+                session_id,
+                dedupe_response_id,
+                getattr(conv, "external_session_id", None),
+                dedupe_existing_item_id,
+                content=mirror_content,
+            )
+            return dedupe_existing_item_id
         # A native user message round-tripping back from the transcript:
         # drain its optimistic pending-input entry (FIFO) and fold the
         # entry's file blocks (image / file) into the item BEFORE persisting.
@@ -5512,14 +5578,18 @@ async def _persist_external_conversation_item(
                 conversation_store.append, session_id, [item]
             )
         except Exception:
-            # Append failed before persistence: release the claim so a retry
-            # is not silently dropped.
-            if dedupe_response_id is not None:
-                external_item_dedupe.release(session_id, dedupe_response_id)
+            # Append failed before persistence: abort this owner's tentative
+            # claim so a retry can re-acquire it (never drop a retry silently).
+            dedupe_claim = await _abort_and_close_dedupe_claim(dedupe_claim)
             raise
         persisted = persisted_items[0]
-        if dedupe_response_id is not None:
-            external_item_dedupe.commit(session_id, dedupe_response_id, persisted.id)
+        if dedupe_claim is not None:
+            await asyncio.to_thread(dedupe_claim.commit, persisted.id)
+            dedupe_claim = await _close_dedupe_claim(dedupe_claim)
+    finally:
+        # Safety net: never leak a held cross-process flock.
+        if dedupe_claim is not None:
+            await _close_dedupe_claim(dedupe_claim)
     await _seed_missing_title_from_user_message(conv, item, conversation_store)
     if pending_background_title is not None:
         pending_background_title.schedule()
@@ -5529,6 +5599,7 @@ async def _persist_external_conversation_item(
             dedupe_response_id,
             getattr(conv, "external_session_id", None),
             persisted.id,
+            content=mirror_content,
         )
     _publish_external_conversation_item(
         session_id, persisted, cleared_pending_id=cleared_pending_id

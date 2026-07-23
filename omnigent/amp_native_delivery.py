@@ -57,6 +57,11 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+# Schema versions the loader can interpret safely. A record written by a
+# newer/unknown version is rejected on load (returns None) rather than read
+# with the current shape, which could misinterpret fields and corrupt the
+# monotonic state machine on the next write.
+SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({SCHEMA_VERSION})
 _DELIVERY_DIR = "delivery"
 _REASON_MAX = 200
 
@@ -160,7 +165,14 @@ def sanitize_reason(text: str | None) -> str | None:
 
 
 class DurabilityError(RuntimeError):
-    """Raised when an fsync cannot establish on-disk durability (fail closed)."""
+    """Raised when an fsync cannot establish on-disk durability (fail closed).
+
+    A subclass of :class:`RuntimeError` so it carries a clear, typed identity
+    the executor can distinguish from a post-mutation ``RuntimeError``: a
+    durability failure happens before any byte can reach Amp (the durable write
+    did not complete), so the delivery may safely become ``failed`` rather than
+    the ambiguous ``recovery_required``.
+    """
 
 
 @dataclass(frozen=True)
@@ -218,8 +230,18 @@ class DeliveryJournal:
         dir_fd = os.open(self._dir, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
+        except OSError as exc:
+            raise DurabilityError(f"directory fsync failed: {exc}") from exc
         finally:
             os.close(dir_fd)
+
+    @staticmethod
+    def _fsync_file(handle) -> None:
+        """fsync an open file handle — fail closed with a typed error."""
+        try:
+            os.fsync(handle.fileno())
+        except OSError as exc:
+            raise DurabilityError(f"file fsync failed: {exc}") from exc
 
     def _write_atomic(self, record: DeliveryRecord) -> None:
         """Persist a record with temp-file + ``os.replace`` + fail-closed fsync."""
@@ -232,7 +254,7 @@ class DeliveryJournal:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(payload)
                 handle.flush()
-                os.fsync(handle.fileno())
+                self._fsync_file(handle)
             os.replace(temporary, self._path(record.delivery_id))
             temporary = None  # rename consumed the temp file
             self._fsync_dir()
@@ -355,47 +377,94 @@ class DeliveryJournal:
         response_id: str,
         expected_thread_id: str | None = None,
         confirmed_item_id: str | None = None,
+        content: str | None = None,
     ) -> ConfirmationOutcome:
-        """Confirm the single outstanding delivery for a plugin mirror.
+        """Confirm the outstanding delivery for a plugin mirror.
 
         Correlates the plugin-mirrored user message (carrying a ``response_id``
         of ``<thread_id>:<event_id>`` from the matching ``agent.start``) with
-        the one record still in ``submission_started``. Validates the
-        ``response_id`` thread component against the conversation's bound
-        ``external_session_id`` when known, and stamps the durable Omnigent
-        item id so a duplicate post can return it. Safe under concurrency: the
-        transition is a locked CAS, and zero/multiple outstanding records are a
-        no-op (ambiguous → no guessing).
+        the matching delivery record and stamps the durable Omnigent item id so
+        a duplicate post can return it.
+
+        A confirmation may arrive AFTER a restart reconcile moved the delivery
+        to ``recovery_required`` (the mirror raced the recreate window), so
+        candidates include both ``submission_started`` and ``recovery_required``
+        records. The correlation prefers a record already stamped with this
+        ``response_id`` (a retried post), then falls back to the
+        paste-canonical content digest when no response_id is stamped yet
+        (the first mirror, which arrives without a prior correlation).
+        Confirmation is idempotent: a confirmed record is never re-confirmed,
+        and a confirmed-then-recovery transition is impossible (the table
+        forbids it). Zero or ambiguous candidates are a no-op (never guess).
         """
         if expected_thread_id and not _response_id_matches_thread(response_id, expected_thread_id):
             return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
-        outstanding = [
-            r for r in self.load_all() if r.state == DeliveryState.SUBMISSION_STARTED.value
+        records = self.load_all()
+        already = any(
+            r.state == DeliveryState.CONFIRMED.value and r.response_id == response_id
+            for r in records
+        )
+        candidates = [
+            r
+            for r in records
+            if r.state
+            in (
+                DeliveryState.SUBMISSION_STARTED.value,
+                DeliveryState.RECOVERY_REQUIRED.value,
+            )
         ]
-        if len(outstanding) != 1:
-            return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
-        target = outstanding[0]
+        target = self._select_confirm_target(candidates, response_id, content)
+        if target is None:
+            return ConfirmationOutcome(
+                confirmed=False, delivery_id=None, already_confirmed=already
+            )
         updated = self.confirm(
             target.delivery_id,
             response_id=response_id,
             confirmed_item_id=confirmed_item_id,
         )
         if updated is None:
-            # Lost a race to a terminal state (e.g. reconcile). If it landed in
-            # confirmed this mirror is a harmless duplicate; otherwise surface
-            # non-confirmation.
+            # Lost a race to a terminal state (e.g. reconcile to confirmed via a
+            # duplicate). Harmless: the item is already durably represented.
             current = self.get(target.delivery_id)
-            already = current is not None and current.state == DeliveryState.CONFIRMED.value
+            now_confirmed = current is not None and current.state == DeliveryState.CONFIRMED.value
             return ConfirmationOutcome(
                 confirmed=False,
                 delivery_id=target.delivery_id,
-                already_confirmed=already,
+                already_confirmed=now_confirmed,
             )
         return ConfirmationOutcome(
             confirmed=updated.state == DeliveryState.CONFIRMED.value,
             delivery_id=updated.delivery_id,
             already_confirmed=False,
         )
+
+    @staticmethod
+    def _select_confirm_target(
+        candidates: list[DeliveryRecord], response_id: str, content: str | None
+    ) -> DeliveryRecord | None:
+        """Pick the single delivery a plugin mirror confirms.
+
+        Prefer an already-stamped ``response_id`` match (a retried post); else
+        match by the paste-canonical content digest (the first mirror); else
+        resolve a single unambiguous outstanding candidate. Zero-or-many after
+        all of those is ambiguous and resolves to None so the caller never
+        guesses which delivery a mirror confirms.
+        """
+        by_response_id = [r for r in candidates if r.response_id == response_id]
+        if len(by_response_id) == 1:
+            return by_response_id[0]
+        if len(by_response_id) > 1:
+            return None
+        if content is not None:
+            digest = normalized_content_hash(content)
+            by_hash = [r for r in candidates if r.normalized_content_hash == digest]
+            if len(by_hash) == 1:
+                return by_hash[0]
+            if len(by_hash) > 1:
+                return None
+        # Single outstanding record is unambiguous: confirm it.
+        return candidates[0] if len(candidates) == 1 else None
 
     def mark_recovery_required(
         self, delivery_id: str, *, reason: str | None = None
@@ -467,8 +536,14 @@ def _record_from_dict(data: dict[str, Any]) -> DeliveryRecord | None:
     if not isinstance(data, dict):
         return None
     try:
+        schema_version = int(data.get("schema_version", SCHEMA_VERSION))
+        if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+            # A record from an unknown/future schema cannot be interpreted
+            # safely with the current shape — skip it rather than risk a
+            # misread that corrupts the monotonic state machine on write.
+            return None
         return DeliveryRecord(
-            schema_version=int(data.get("schema_version", SCHEMA_VERSION)),
+            schema_version=schema_version,
             delivery_id=str(data["delivery_id"]),
             conversation_id=data.get("conversation_id"),
             response_id=data.get("response_id"),
