@@ -28,6 +28,7 @@ from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import (
+    AMP_NATIVE_CODING_AGENT,
     ANTIGRAVITY_NATIVE_CODING_AGENT,
     CLAUDE_NATIVE_CODING_AGENT,
     CODEX_NATIVE_CODING_AGENT,
@@ -167,6 +168,7 @@ _WEB_UI_GZIP_MINIMUM_SIZE = 1024
 _CLAUDE_NATIVE_AGENT_NAME = CLAUDE_NATIVE_CODING_AGENT.agent_name
 _CODEX_NATIVE_AGENT_NAME = CODEX_NATIVE_CODING_AGENT.agent_name
 _PI_NATIVE_AGENT_NAME = PI_NATIVE_CODING_AGENT.agent_name
+_AMP_NATIVE_AGENT_NAME = AMP_NATIVE_CODING_AGENT.agent_name
 _OPENCODE_NATIVE_AGENT_NAME = OPENCODE_NATIVE_CODING_AGENT.agent_name
 _CURSOR_NATIVE_AGENT_NAME = CURSOR_NATIVE_CODING_AGENT.agent_name
 _KIRO_NATIVE_AGENT_NAME = KIRO_NATIVE_CODING_AGENT.agent_name
@@ -491,6 +493,7 @@ def _ensure_default_agents(
     _ensure_default_claude_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_codex_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_pi_agent(agent_store, artifact_store, agent_cache)
+    _ensure_default_amp_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_opencode_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_cursor_agent(agent_store, artifact_store, agent_cache)
     _ensure_default_kiro_agent(agent_store, artifact_store, agent_cache)
@@ -744,6 +747,29 @@ def _ensure_default_pi_agent(
         name=_PI_NATIVE_AGENT_NAME,
         bundle_bytes=_build_pi_native_bundle(),
     )
+
+
+def _ensure_default_amp_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+) -> None:
+    """Register or refresh the built-in interactive Amp agent."""
+    import tempfile
+
+    from omnigent.amp_native import _materialize_amp_agent_spec
+    from omnigent.spec import materialize_bundle
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        spec = _materialize_amp_agent_spec(Path(tmpdir))
+        bundle = materialize_bundle(spec, Path(tmpdir) / "bundle")
+        _ensure_builtin_agent(
+            agent_store,
+            artifact_store,
+            agent_cache,
+            name=_AMP_NATIVE_AGENT_NAME,
+            bundle_bytes=_tar_gz_dir(bundle),
+        )
 
 
 def _build_cursor_native_bundle() -> bytes:

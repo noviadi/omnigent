@@ -5369,6 +5369,11 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         function="run_pi_native",
         args_param="pi_args",
     ),
+    "amp": _NativeTerminalDispatchSpec(
+        module="omnigent.amp_native",
+        function="run_amp_native",
+        args_param="amp_args",
+    ),
     "opencode": _NativeTerminalDispatchSpec(
         module="omnigent.opencode_native",
         function="run_opencode_native",

@@ -108,6 +108,7 @@ OMNIGENT_HARNESSES = frozenset(
         "opencode-native",
         "pi",
         "pi-native",
+        "amp-native",
         "qwen",
         "qwen-native",
     },
