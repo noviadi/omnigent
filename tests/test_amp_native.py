@@ -102,7 +102,16 @@ def test_inject_user_message_reaches_tmux_without_vendor_readiness_delay(
         )
 
         started = time.monotonic()
-        amp_native_bridge.inject_user_message(bridge, "hello from browser")
+        from omnigent.amp_native_delivery import DeliveryJournal
+
+        journal = DeliveryJournal(bridge)
+        record = journal.create(content="hello from browser", conversation_id="conv_1")
+        amp_native_bridge.inject_user_message(
+            bridge,
+            "hello from browser",
+            journal=journal,
+            delivery_id=record.delivery_id,
+        )
         elapsed = time.monotonic() - started
         pane = subprocess.run(
             ["tmux", "-S", str(socket), "capture-pane", "-p", "-t", target],
@@ -137,10 +146,7 @@ def test_managed_install_permissions_and_conflict(
 
 def test_plugin_resource_uses_typed_thread_and_external_event_contracts() -> None:
     source = (
-        Path(amp_native_bridge.__file__).parent
-        / "resources"
-        / "amp_native"
-        / "omnigent-native.ts"
+        Path(amp_native_bridge.__file__).parent / "resources" / "amp_native" / "omnigent-native.ts"
     ).read_text(encoding="utf-8")
     assert 'import type { PluginAPI, ThreadID } from "@ampcode/plugin"' in source
     assert "amp.threads.get(managedThreadID)" in source
