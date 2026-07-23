@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -152,7 +153,12 @@ def test_plugin_resource_uses_typed_thread_and_external_event_contracts() -> Non
     ).read_text(encoding="utf-8")
     assert 'import type { PluginAPI, ThreadID } from "@ampcode/plugin"' in source
     assert "amp.threads.get(managedThreadID)" in source
-    assert "event.thread?.id !== managedThreadID" in source
+    # First-turn adoption: agent.start adopts the event thread when no managed
+    # thread is attributed yet (session.start may fire late or not at all in
+    # some Amp runtimes) instead of bailing and dropping the turn-started
+    # signal. Later turns still reject other threads.
+    assert "if (!managedThreadID) managedThreadID = event.thread.id" in source
+    assert "else if (event.thread.id !== managedThreadID) return" in source
     assert 'type: "external_conversation_item", data:' in source
     assert 'type: "external_assistant_message", data:' in source
     assert 'type: "external_session_status", data:' in source
@@ -166,6 +172,112 @@ def test_plugin_resource_uses_typed_thread_and_external_event_contracts() -> Non
     assert "readPendingToken" in source
     # The token is captured and the marker written BEFORE any awaited POST.
     assert "signalTurnStarted(readPendingToken())" in source
+
+
+# Drives the real TypeScript handler. Node >= 23 strips types from .ts imports
+# out of the box, so this exercises the actual adoption logic rather than a
+# string check or a fake that stamps the marker inside the Enter path. The
+# harness reads everything but the plugin path from the environment, so its
+# source needs no Python brace-escaping.
+_FIRST_TURN_HARNESS = """\
+import fs from "node:fs";
+import path from "node:path";
+import plugin from "file://__PLUGIN__";
+const bridgeDir = process.env.BR;
+const tsFile = path.join(bridgeDir, process.env.TS_FILE);
+const pdFile = path.join(bridgeDir, process.env.PD_FILE);
+const handlers = {};
+const amp = {
+  on: (event, cb) => { handlers[event] = cb; },
+  threads: { get: async () => ({ cancel: async () => {} }) },
+};
+plugin(amp);
+// FIRST-TURN ORDERING: agent.start arrives with NO prior session.start, so the
+// managed thread is unattributed when it runs. The handler must adopt this
+// thread and stamp the marker with THIS delivery's token rather than bail.
+await handlers["agent.start"]({ id: "resp-1", thread: { id: "T-managed" }, message: "hello" });
+let marker = null;
+try { marker = JSON.parse(fs.readFileSync(tsFile, "utf8")); } catch {}
+console.log("MARKER=" + JSON.stringify(marker));
+// A later agent.start from a different thread must be rejected and must not
+// re-stamp the marker with a newer token.
+fs.writeFileSync(pdFile, JSON.stringify({ token: "other-token" }));
+await handlers["agent.start"]({ id: "resp-2", thread: { id: "T-other" }, message: "ignored" });
+console.log("AFTER=" + JSON.stringify(JSON.parse(fs.readFileSync(tsFile, "utf8"))));
+process.exit(0);
+"""
+
+
+def test_plugin_first_agent_start_writes_marker_without_session_start(
+    tmp_path: Path,
+) -> None:
+    """The first turn's agent.start must signal turn-started even when it fires
+    before (or without) session.start attributing a managed thread.
+
+    Reproduces the live regression: on the prior code the guard bailed because
+    ``managedThreadID`` was unset, so no marker was written and the bridge
+    exhausted its submit retry budget. Runs the real handler under Node's type
+    stripping with the real event payload shape.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+
+    plugin = (
+        Path(amp_native_bridge.__file__).parent / "resources" / "amp_native" / "omnigent-native.ts"
+    )
+    bridge = tmp_path / "bridge"
+    inbox = bridge / "inbox"
+    inbox.mkdir(parents=True)
+    token = "first-turn-token"
+    (bridge / amp_native_bridge._PENDING_DELIVERY_FILE).write_text(
+        json.dumps({"token": token}), encoding="utf-8"
+    )
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "sessionId": "s",
+                # Refused connection: the plugin fails open on POST, but stamps
+                # the marker synchronously before any awaited POST.
+                "serverUrl": "http://127.0.0.1:1",
+                "authHeaders": {},
+                "inboxDir": str(inbox),
+            }
+        ),
+        encoding="utf-8",
+    )
+    harness = tmp_path / "harness.mjs"
+    harness.write_text(_FIRST_TURN_HARNESS.replace("__PLUGIN__", str(plugin)), encoding="utf-8")
+
+    result = subprocess.run(
+        [node, str(harness)],
+        env={
+            **os.environ,
+            "BR": str(bridge),
+            "TS_FILE": amp_native_bridge._TURN_STARTED_FILE,
+            "PD_FILE": amp_native_bridge._PENDING_DELIVERY_FILE,
+            "OMNIGENT_AMP_NATIVE_CONFIG": str(config),
+        },
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+
+    def _payload(prefix: str) -> dict[str, object]:
+        line = next(line for line in result.stdout.splitlines() if line.startswith(prefix))
+        return json.loads(line.split("=", 1)[1])
+
+    marker = _payload("MARKER=")
+    after = _payload("AFTER=")
+
+    # The first-turn marker was written with THIS delivery's token despite no
+    # session.start — the regression dropped it entirely.
+    assert marker.get("token") == token
+    # Cross-thread guard still holds: a later agent.start from another thread
+    # did not adopt it or re-stamp a newer token.
+    assert after.get("token") == token
 
 
 # ── Verified bounded submit (AMP-NATIVE-0-2) ───────────────────────────────

@@ -81,7 +81,12 @@ export default function omnigentNative(amp: PluginAPI): void {
     await persistThreadID(id);
   });
   amp.on("agent.start", async (event: AmpEvent) => {
-    if (!managedThreadID || event.thread?.id !== managedThreadID) return;
+    // First turn can arrive before session.start attributes a managed thread
+    // (some Amp runtimes never emit it): adopt this thread on first contact
+    // rather than drop the turn-started signal; later turns reject others.
+    if (!event.thread?.id) return;
+    if (!managedThreadID) managedThreadID = event.thread.id;
+    else if (event.thread.id !== managedThreadID) return;
     const response_id = responseID(event);
     activeResponseID = response_id;
     // Capture this delivery's token and stamp the marker BEFORE any awaited
