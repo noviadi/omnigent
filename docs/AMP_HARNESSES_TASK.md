@@ -1,4 +1,9 @@
-# Amp-native hardening tasks
+<!-- SUPERSEDED: see docs/AMP_HARNESSES_PLAN.md for the current vision, -->
+<!-- boundaries, and Phase 0 task list. This file's durability-heavy tasks -->
+<!-- (001, 008, 010, etc.) are DEFERRED per the parity bar documented there. -->
+<!-- Kept for history only; do not implement from this list without checking PLAN. -->
+
+# Amp-native hardening tasks (historical)
 
 This task list covers reliability hardening for the currently implemented
 `amp-native` interactive harness. It is ordered by priority and informed by
