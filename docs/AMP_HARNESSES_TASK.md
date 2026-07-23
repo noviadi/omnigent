@@ -23,7 +23,7 @@ re-checked against code at the start of each implementation pass.
 
 | Task | Status | Notes |
 | --- | --- | --- |
-| AMP-NATIVE-001 | Implemented | Durable versioned delivery journal (`amp_native_delivery.py`); executor reconciles non-terminal records to `recovery_required` on restart (no blind replay); `submission_started` is fsynced before paste; terminal recreate preserves delivery state; server-side set-once dedupe (`external_item_dedupe.py`) keyed by the `agent.start` `response_id`. Covered by `tests/test_amp_native_delivery.py`. |
+| AMP-NATIVE-001 | Implemented | Durable versioned delivery journal (`amp_native_delivery.py`) with monotonic CAS transitions (per-record `fcntl` lock, reject regressions) and fail-closed fsync; `submission_started` is fsynced before paste; post-mutation failures become `recovery_required` (never replayable `failed`); executor reconciles non-terminal records to `recovery_required` on restart (no blind replay); confirmation is wired through the real plugin-mirror event path (`confirm_outstanding`, validated by matching thread + `response_id`); durable cross-process set-once dedupe (`external_item_dedupe.py`) keyed by the `agent.start` `response_id`, committed after append and recovered against the store on a crashed-mid-append; runner recreate reconciles and publishes a typed recovery event. Covered by `tests/test_amp_native_delivery.py`. |
 | AMP-NATIVE-002 | Partial | Multiline buffer paste works; no readiness signal or paste verification |
 | AMP-NATIVE-003 | Partial | Plugin binds first ID and ignores conflicts; no authoritative-ID comparison or recovery state |
 | AMP-NATIVE-004 | Partial | Only `socket_path`/`tmux_target` persisted; mutations check `has-session` only |
