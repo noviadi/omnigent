@@ -124,6 +124,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
+    external_item_dedupe,
     get_agent_cache,
     get_caps,
     get_policy_store,
@@ -5364,6 +5365,21 @@ async def _persist_external_conversation_item(
     :returns: Store-assigned conversation item id.
     """
     item = _parse_external_conversation_item(body)
+    # Set-once dedupe for browser-prompt user messages. The plugin's
+    # ``response_id`` is derived from the Amp ``agent.start`` of the matching
+    # thread, so it is stable across plugin retries. A retried post must NOT
+    # append a second durable item NOR drain the next optimistic pending-input
+    # entry (the FIFO drain would otherwise misbind the retried prompt to a
+    # different browser message). See :mod:`omnigent.runtime.external_item_dedupe`.
+    if (
+        item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and not item.data.is_meta
+        and item.response_id
+        and not external_item_dedupe.claim(session_id, item.response_id)
+    ):
+        return item.response_id
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry (FIFO) and fold the
     # entry's file blocks (image / file) into the item BEFORE persisting.

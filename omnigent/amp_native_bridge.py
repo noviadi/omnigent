@@ -11,9 +11,13 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+
+from omnigent.amp_native_delivery import DeliveryJournal
 
 AMP_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_AMP_NATIVE_BRIDGE_DIR"
 AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_AMP_NATIVE_REQUEST_SESSION_ID"
@@ -23,6 +27,21 @@ _SEQUENCE = itertools.count()
 MANAGED_MARKER = "// omnigent-managed-amp-native-plugin"
 _TMUX_FILE = "tmux.json"
 _TMUX_BUFFER = "omnigent_amp_native_paste"
+
+
+@dataclass(frozen=True)
+class InjectionHooks:
+    """Boundary callbacks for delivery fault-injection tests.
+
+    Each callable fires at a named point of
+    :func:`inject_user_message`. A test raises from inside one to simulate
+    the harness dying at exactly that boundary so the resulting journal
+    state and replay behavior can be asserted. ``None`` means "no hook".
+    """
+
+    before_paste: Callable[[], None] | None = None
+    after_paste: Callable[[], None] | None = None
+    after_enter: Callable[[], None] | None = None
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -79,7 +98,14 @@ def enqueue_interrupt(path: Path) -> str:
     return _enqueue(path, {"id": item_id, "type": "interrupt"})
 
 
-def inject_user_message(path: Path, content: str) -> None:
+def inject_user_message(
+    path: Path,
+    content: str,
+    *,
+    journal: DeliveryJournal | None = None,
+    delivery_id: str | None = None,
+    hooks: InjectionHooks | None = None,
+) -> None:
     """Paste a browser prompt into the resident Amp TUI.
 
     A blank Amp TUI has no thread yet, so its plugin cannot address the first
@@ -87,6 +113,13 @@ def inject_user_message(path: Path, content: str) -> None:
     thread naturally and also keeps every browser turn visible in the real TUI.
     The plugin observes the resulting ``agent.start`` and mirrors the user item
     back through Omnigent's pending-input reconciliation path.
+
+    When a ``journal`` and ``delivery_id`` are supplied, the delivery state is
+    advanced atomically (write + ``fsync``) to ``submission_started`` BEFORE any
+    paste or Enter byte can reach Amp. A crash after that point therefore leaves
+    a durable record the runner reconciles into ``recovery_required`` on restart
+    rather than silently re-injecting the prompt. ``hooks`` expose the three
+    paste/Enter boundary points for fault-injection tests.
     """
     if not content:
         raise RuntimeError("amp-native injection requires non-empty content")
@@ -132,6 +165,13 @@ def inject_user_message(path: Path, content: str) -> None:
             payload.append(0x09)
         elif ord(character) >= 0x20:
             payload.extend(character.encode("utf-8"))
+
+    # Durable submission marker BEFORE any paste/Enter byte can reach Amp.
+    # Once this is on disk the runner must never blindly replay the prompt.
+    if journal is not None and delivery_id is not None:
+        journal.mark_submission_started(delivery_id)
+    if hooks is not None and hooks.before_paste is not None:
+        hooks.before_paste()
     with tempfile.NamedTemporaryFile(dir=path, prefix="paste_", delete=False) as paste:
         paste.write(bytes(payload))
         paste_path = paste.name
@@ -147,8 +187,12 @@ def inject_user_message(path: Path, content: str) -> None:
             "-t",
             tmux_target,
         )
+        if hooks is not None and hooks.after_paste is not None:
+            hooks.after_paste()
         time.sleep(0.1)
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        if hooks is not None and hooks.after_enter is not None:
+            hooks.after_enter()
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
@@ -196,6 +240,8 @@ def install_plugin_and_config(
         if os.path.exists(temporary):
             os.unlink(temporary)
     return target, config
+
+
 def _run_tmux(socket_path: str, *args: str) -> None:
     try:
         result = subprocess.run(
