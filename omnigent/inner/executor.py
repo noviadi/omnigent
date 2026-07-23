@@ -175,6 +175,23 @@ class TurnComplete(ExecutorEvent):
     usage: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class LiveQueueResult:
+    """Typed outcome of a live-queue message enqueue.
+
+    ``accepted`` is the bool-equivalent (a refusal is falsy). ``reason`` carries
+    a machine-readable marker such as ``"[amp_native_delivery_recovery_required]
+    ..."`` so a caller can distinguish a recovery refusal from an unsupported
+    queue — never a bare ``False``.
+    """
+
+    accepted: bool
+    reason: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
 class ToolCallStatus(str, enum.Enum):
     SUCCESS = "success"
     ERROR = "error"
@@ -570,8 +587,17 @@ class Executor:
         """Ask the executor to interrupt a currently running turn, if supported."""
         return False
 
-    async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+    async def enqueue_session_message(
+        self,
+        session_key: str,  # noqa: ARG002
+        content: EnqueuedContent,  # noqa: ARG002
+    ) -> bool | LiveQueueResult:
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        Implementations may return a :class:`LiveQueueResult` instead of a bare
+        bool to surface a typed reason (e.g. a delivery-recovery refusal); a
+        bool remains accepted for legacy implementations.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:

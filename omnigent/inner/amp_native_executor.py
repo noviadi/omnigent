@@ -23,6 +23,7 @@ from omnigent.amp_native_bridge import (
     AMP_NATIVE_BRIDGE_DIR_ENV_VAR,
     AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     InjectionHooks,
+    InjectionPreconditionError,
     inject_user_message,
 )
 from omnigent.amp_native_delivery import DeliveryJournal, DeliveryState
@@ -31,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    LiveQueueResult,
     Message,
     ToolSpec,
     TurnComplete,
@@ -108,22 +110,31 @@ class AmpNativeExecutor(Executor):
                 return record.delivery_id
         return None
 
-    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+    async def enqueue_session_message(
+        self, session_key: str, content: Any
+    ) -> bool | LiveQueueResult:
         """Inject a mid-session message, gated by delivery recovery state.
 
-        Returns ``False`` (rather than injecting) when the message is a retry of
-        a prompt already marked recovery_required, so a live-queue retry cannot
-        blind-replay an interrupted delivery.
+        Returns a typed :class:`LiveQueueResult` (never a bare ``False``):
+        ``accepted=False`` with a ``[amp_native_delivery_recovery_required]`` /
+        ``[amp_native_delivery_failed]`` reason when the message is blocked, so
+        the caller can distinguish a recovery refusal from an unsupported queue.
         """
         del session_key
         text = _content_to_text(content)
         if not text:
-            return False
-        if self._recovery_record_for(text) is not None:
-            _logger.warning("amp-native live-queue message refused: delivery in recovery_required")
-            return False
+            return LiveQueueResult(accepted=False, reason="empty message")
+        recovery_id = self._recovery_record_for(text)
+        if recovery_id is not None:
+            return LiveQueueResult(
+                accepted=False,
+                reason=(
+                    f"[{RECOVERY_ERROR_CODE}] delivery {recovery_id} was interrupted "
+                    "before confirmation; resubmission is blocked."
+                ),
+            )
+        record = self._journal.create(content=text, conversation_id=self._conversation_id)
         try:
-            record = self._journal.create(content=text, conversation_id=self._conversation_id)
             await asyncio.to_thread(
                 inject_user_message,
                 self._bridge_dir,
@@ -131,9 +142,21 @@ class AmpNativeExecutor(Executor):
                 journal=self._journal,
                 delivery_id=record.delivery_id,
             )
-        except RuntimeError:
-            return False
-        return True
+        except InjectionPreconditionError as exc:
+            # No byte reached Amp: safe to mark failed and let a retry proceed.
+            self._journal.mark_failed(record.delivery_id, reason=str(exc))
+            return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
+        except RuntimeError as exc:
+            # A mutation may have reached Amp: never ``failed`` (replayable).
+            self._journal.mark_recovery_required(record.delivery_id, reason=str(exc))
+            return LiveQueueResult(
+                accepted=False,
+                reason=(
+                    f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
+                    "interrupted after submission started; resubmission is blocked."
+                ),
+            )
+        return LiveQueueResult(accepted=True)
 
     async def run_turn(
         self,
@@ -166,9 +189,8 @@ class AmpNativeExecutor(Executor):
                 )
             )
             return
-        record = None
+        record = self._journal.create(content=text, conversation_id=self._conversation_id)
         try:
-            record = self._journal.create(content=text, conversation_id=self._conversation_id)
             await asyncio.to_thread(
                 inject_user_message,
                 self._bridge_dir,
@@ -177,10 +199,23 @@ class AmpNativeExecutor(Executor):
                 delivery_id=record.delivery_id,
                 hooks=self._injection_hooks(),
             )
-        except RuntimeError as exc:
-            if record is not None:
-                self._journal.mark_failed(record.delivery_id, reason=f"injection error: {exc}")
+        except InjectionPreconditionError as exc:
+            # Pre-paste failure: no byte could have reached Amp, so the record
+            # may safely become ``failed`` (a retry can create a new delivery).
+            self._journal.mark_failed(record.delivery_id, reason=str(exc))
             yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
+            return
+        except RuntimeError as exc:
+            # Post-mutation failure: Amp may have received the prompt, so this
+            # must become ``recovery_required`` — never ``failed`` (replayable).
+            self._journal.mark_recovery_required(record.delivery_id, reason=str(exc))
+            yield ExecutorError(
+                message=(
+                    f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
+                    "interrupted after submission started; resubmission is blocked. "
+                    "Reconcile the Amp thread outcome or start a new conversation."
+                )
+            )
             return
         yield TurnComplete(response=None)
 

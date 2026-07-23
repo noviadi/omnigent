@@ -600,10 +600,11 @@ class ExecutorAdapter(HarnessApp):
                 )
                 continue
             if not accepted:
+                reason = getattr(accepted, "reason", None)
                 _logger.warning(
-                    "inner executor refused in-band injection "
-                    "(supports_live_message_queue=False?); LLM will "
-                    "not see the steered message until the next turn"
+                    "inner executor refused in-band injection%s; LLM will "
+                    "not see the steered message until the next turn",
+                    f" ({reason})" if reason else "",
                 )
                 continue
             # The executor consumed this injection into the running turn.
