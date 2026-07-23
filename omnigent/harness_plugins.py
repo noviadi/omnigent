@@ -127,8 +127,12 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
 )
 
 AMP_NATIVE_CODING_AGENT = NativeCodingAgent(
-    key="amp", display_name="Amp", agent_name="amp-native-ui",
-    harness="amp-native", wrapper_label=AMP_NATIVE_WRAPPER_VALUE, terminal_name="amp",
+    key="amp",
+    display_name="Amp",
+    agent_name="amp-native-ui",
+    harness="amp-native",
+    wrapper_label=AMP_NATIVE_WRAPPER_VALUE,
+    terminal_name="amp",
 )
 
 OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
@@ -223,9 +227,17 @@ _AU = AuthModel
 # reconciled against the bench's interrupt/streaming probes as coverage expands.
 _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
     "amp-native": _C(
-        _IM.NATIVE_TUI, _EL.NONE, _RS.WARM_REATTACH, _EF.NONE, _MF.MULTI,
-        _AU.OWN_AUTH, subagents=False, interrupt=True, streaming=False,
-        steering=True, live_queue=True,
+        _IM.NATIVE_TUI,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
     ),
     # Native-CLI harnesses (wrap a resident vendor TUI/server).
     "claude-native": _C(

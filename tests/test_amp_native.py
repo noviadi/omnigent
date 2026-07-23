@@ -137,10 +137,7 @@ def test_managed_install_permissions_and_conflict(
 
 def test_plugin_resource_uses_typed_thread_and_external_event_contracts() -> None:
     source = (
-        Path(amp_native_bridge.__file__).parent
-        / "resources"
-        / "amp_native"
-        / "omnigent-native.ts"
+        Path(amp_native_bridge.__file__).parent / "resources" / "amp_native" / "omnigent-native.ts"
     ).read_text(encoding="utf-8")
     assert 'import type { PluginAPI, ThreadID } from "@ampcode/plugin"' in source
     assert "amp.threads.get(managedThreadID)" in source

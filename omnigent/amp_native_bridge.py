@@ -196,6 +196,8 @@ def install_plugin_and_config(
         if os.path.exists(temporary):
             os.unlink(temporary)
     return target, config
+
+
 def _run_tmux(socket_path: str, *args: str) -> None:
     try:
         result = subprocess.run(
