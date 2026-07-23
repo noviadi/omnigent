@@ -23,6 +23,15 @@ _SEQUENCE = itertools.count()
 MANAGED_MARKER = "// omnigent-managed-amp-native-plugin"
 _TMUX_FILE = "tmux.json"
 _TMUX_BUFFER = "omnigent_amp_native_paste"
+# Verified bounded submit (mirrors antigravity's submit-verify loop, adapted to
+# amp-native's turn-started signal). Only ``Enter`` is re-sent, never the paste.
+_TURN_STARTED_FILE = "turn_started.json"
+_MAX_SUBMIT_ATTEMPTS = 3
+# How long one submit Enter is given for the resident plugin to signal that the
+# turn started before it is re-sent. Generous: the signal is local file-IPC and
+# latency is not a correctness concern.
+_SUBMIT_VERIFY_TIMEOUT_S = 5.0
+_SUBMIT_POLL_INTERVAL_S = 0.1
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -147,11 +156,60 @@ def inject_user_message(path: Path, content: str) -> None:
             "-t",
             tmux_target,
         )
-        time.sleep(0.1)
-        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        _submit_and_verify(path, socket_path, tmux_target)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
+
+
+def _turn_started_marker(path: Path) -> Path:
+    return path / _TURN_STARTED_FILE
+
+
+def _turn_started(path: Path) -> bool:
+    """True iff the resident plugin has signalled the turn started on ``agent.start``."""
+    return _turn_started_marker(path).is_file()
+
+
+def _clear_turn_started(path: Path) -> None:
+    """Drop a marker left by a previous turn so the next submit verifies cleanly."""
+    with contextlib.suppress(OSError):
+        _turn_started_marker(path).unlink()
+
+
+def _wait_for_turn_started(path: Path, *, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _turn_started(path):
+            return True
+        time.sleep(_SUBMIT_POLL_INTERVAL_S)
+    return _turn_started(path)
+
+
+def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
+    """Press ``Enter`` to submit the pasted prompt, verifying the turn started.
+
+    Mirrors antigravity's bounded submit-verify loop, keyed on amp-native's
+    turn-started signal: the resident plugin writes ``turn_started.json`` on
+    ``agent.start`` (a local marker mirroring the interrupt inbox). The paste is
+    done once before this call; only ``Enter`` is re-sent, bounded by
+    :data:`_MAX_SUBMIT_ATTEMPTS`. The marker is re-checked before every Enter, so
+    an Enter whose signal lagged past the prior window never produces an Enter
+    after the turn already started. If the turn cannot be confirmed within the
+    budget, raise rather than lose the submit silently.
+    """
+    _clear_turn_started(path)
+    for _ in range(_MAX_SUBMIT_ATTEMPTS):
+        if _turn_started(path):
+            return
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+        if _wait_for_turn_started(path, timeout_s=_SUBMIT_VERIFY_TIMEOUT_S):
+            return
+    raise RuntimeError(
+        "amp-native did not confirm the submitted turn started within the retry "
+        f"budget (<= {_MAX_SUBMIT_ATTEMPTS} Enter attempts); the prompt remains "
+        "unsubmitted — retry the turn or restart the session"
+    )
 
 
 def install_plugin_and_config(

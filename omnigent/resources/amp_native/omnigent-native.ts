@@ -17,6 +17,15 @@ export default function omnigentNative(amp: PluginAPI): void {
   let managedThreadID: ThreadID | undefined;
   let activeResponseID: string | undefined;
   const responseID = (event: AmpEvent): string => `${String(managedThreadID)}:${event.id ?? "event"}`;
+  // Local turn-started marker for the delivery path's submit-verify loop. The
+  // bridge dir is the parent of the inbox dir it already polls, so no new
+  // config field is needed. Mirrors the interrupt inbox's file-IPC, not a new
+  // plugin event type: written on agent.start so the runner can confirm the
+  // submit Enter took effect before re-sending it.
+  const turnStartedPath = path.join(path.dirname(config.inboxDir), "turn_started.json");
+  const signalTurnStarted = (): void => {
+    try { fs.writeFileSync(turnStartedPath, JSON.stringify({ at: Date.now() }), { flag: "w" }); } catch { /* fail open */ }
+  };
   const request = async (url: string, method: string, body: unknown): Promise<boolean> => {
     try {
       const response = await fetch(url, { method, headers: { "content-type": "application/json", ...config.authHeaders }, body: JSON.stringify(body) });
@@ -63,6 +72,7 @@ export default function omnigentNative(amp: PluginAPI): void {
     const text = event.message;
     if (typeof text === "string") await post({ type: "external_conversation_item", data: { item_type: "message", response_id, item_data: { role: "user", content: [{ type: "input_text", text }] } } });
     await post({ type: "external_session_status", data: { status: "running", response_id } });
+    signalTurnStarted();
   });
   amp.on("agent.end", async (event: AmpEvent) => {
     if (!managedThreadID || event.thread?.id !== managedThreadID) return;
