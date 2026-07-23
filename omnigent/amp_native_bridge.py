@@ -25,7 +25,13 @@ _TMUX_FILE = "tmux.json"
 _TMUX_BUFFER = "omnigent_amp_native_paste"
 # Verified bounded submit (mirrors antigravity's submit-verify loop, adapted to
 # amp-native's turn-started signal). Only ``Enter`` is re-sent, never the paste.
+# The marker is correlated to a specific delivery by a per-delivery nonce so a
+# stale marker or a delayed previous-turn write cannot false-confirm.
 _TURN_STARTED_FILE = "turn_started.json"
+# Bridge -> plugin channel for the current delivery's token. The plugin reads
+# this at ``agent.start`` and stamps the marker with it (mirrors the interrupt
+# inbox's file-IPC; no new plugin event type, no config field).
+_PENDING_DELIVERY_FILE = "pending_delivery.json"
 _MAX_SUBMIT_ATTEMPTS = 3
 # How long one submit Enter is given for the resident plugin to signal that the
 # turn started before it is re-sent. Generous: the signal is local file-IPC and
@@ -166,44 +172,99 @@ def _turn_started_marker(path: Path) -> Path:
     return path / _TURN_STARTED_FILE
 
 
-def _turn_started(path: Path) -> bool:
-    """True iff the resident plugin has signalled the turn started on ``agent.start``."""
-    return _turn_started_marker(path).is_file()
+def _pending_delivery_marker(path: Path) -> Path:
+    return path / _PENDING_DELIVERY_FILE
+
+
+def _write_pending_delivery(path: Path, token: str) -> None:
+    """Publish this delivery's token so the plugin can stamp the marker with it.
+
+    Atomic (temp + replace) like the interrupt inbox. Delivery is serialized per
+    session, so this is the only token in flight when the plugin reads it.
+    """
+    payload = json.dumps({"token": token})
+    fd, temporary = tempfile.mkstemp(prefix=".pending.", suffix=".tmp", dir=path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(temporary, _pending_delivery_marker(path))
+    finally:
+        if os.path.exists(temporary):
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+
+
+def _confirm_turn_started(path: Path, expected_token: str) -> bool:
+    """True iff the resident plugin signalled THIS delivery's turn started.
+
+    Confirmation requires a marker stamped with ``expected_token``. A stale
+    marker, a delayed previous-turn write, or a half-written/unreadable marker
+    has the wrong (or no) token and is ignored — never treated as confirmation.
+    """
+    try:
+        raw = _turn_started_marker(path).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("token") == expected_token
 
 
 def _clear_turn_started(path: Path) -> None:
-    """Drop a marker left by a previous turn so the next submit verifies cleanly."""
-    with contextlib.suppress(OSError):
-        _turn_started_marker(path).unlink()
+    """Best-effort hygiene: drop a marker left by a previous turn.
+
+    Non-load-bearing: confirmation is keyed on the delivery token, so a marker
+    that survives a clear failure (or lands after it) cannot false-confirm — it
+    simply carries the wrong token and is ignored. A failed clear is therefore
+    tolerated rather than aborting a delivery whose paste already landed.
+    """
+    marker = _turn_started_marker(path)
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        # Token matching guards confirmation; leave the stale marker in place.
+        return
 
 
-def _wait_for_turn_started(path: Path, *, timeout_s: float) -> bool:
+def _wait_for_turn_started(path: Path, expected_token: str, *, timeout_s: float) -> bool:
     deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _turn_started(path):
+    while True:
+        if _confirm_turn_started(path, expected_token):
             return True
+        if time.monotonic() >= deadline:
+            return _confirm_turn_started(path, expected_token)
         time.sleep(_SUBMIT_POLL_INTERVAL_S)
-    return _turn_started(path)
 
 
 def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
     """Press ``Enter`` to submit the pasted prompt, verifying the turn started.
 
     Mirrors antigravity's bounded submit-verify loop, keyed on amp-native's
-    turn-started signal: the resident plugin writes ``turn_started.json`` on
-    ``agent.start`` (a local marker mirroring the interrupt inbox). The paste is
-    done once before this call; only ``Enter`` is re-sent, bounded by
-    :data:`_MAX_SUBMIT_ATTEMPTS`. The marker is re-checked before every Enter, so
-    an Enter whose signal lagged past the prior window never produces an Enter
-    after the turn already started. If the turn cannot be confirmed within the
-    budget, raise rather than lose the submit silently.
+    turn-started signal correlated to THIS delivery by a per-delivery token: the
+    bridge mints a nonce and publishes it (:func:`_write_pending_delivery`); the
+    plugin reads it at ``agent.start`` and stamps ``turn_started.json`` with it.
+    Only a marker whose token matches this delivery confirms the submit, so a
+    stale marker or a delayed previous-turn write is ignored.
+
+    The paste is done once before this call; only ``Enter`` is re-sent, bounded
+    by :data:`_MAX_SUBMIT_ATTEMPTS`. The matching marker is re-checked
+    immediately before every Enter, so an Enter whose signal lagged past the
+    prior window never produces an Enter after this delivery's turn already
+    started. If the turn cannot be confirmed within the budget, raise rather
+    than lose the submit silently.
     """
+    token = uuid.uuid4().hex
+    _write_pending_delivery(path, token)
     _clear_turn_started(path)
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
-        if _turn_started(path):
+        if _confirm_turn_started(path, token):
             return
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-        if _wait_for_turn_started(path, timeout_s=_SUBMIT_VERIFY_TIMEOUT_S):
+        if _wait_for_turn_started(path, token, timeout_s=_SUBMIT_VERIFY_TIMEOUT_S):
             return
     raise RuntimeError(
         "amp-native did not confirm the submitted turn started within the retry "
