@@ -58,9 +58,9 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 # Schema versions the loader can interpret safely. A record written by a
-# newer/unknown version is rejected on load (returns None) rather than read
-# with the current shape, which could misinterpret fields and corrupt the
-# monotonic state machine on the next write.
+# newer/unknown version is rejected on load (raises JournalCorruptError) rather
+# than read with the current shape, which could misinterpret fields and corrupt
+# the monotonic state machine on the next write.
 SUPPORTED_SCHEMA_VERSIONS: frozenset[int] = frozenset({SCHEMA_VERSION})
 _DELIVERY_DIR = "delivery"
 _REASON_MAX = 200
@@ -78,6 +78,14 @@ class DeliveryState(str, enum.Enum):
 
 # States with no proven terminal outcome; a restart must never replay them.
 _NON_TERMINAL_STATES = frozenset({DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED})
+
+# States for which a same-prompt retry must be blocked: no proven outcome
+# (pending/submission_started — paste may have happened) OR already flagged as
+# needing recovery. Only confirmed/failed have a proven outcome and may allow a
+# new delivery for the same prompt.
+_RETRY_BLOCKING_STATES = frozenset(
+    {DeliveryState.PENDING, DeliveryState.SUBMISSION_STARTED, DeliveryState.RECOVERY_REQUIRED}
+)
 
 
 # Monotonic transition table: the set of source states from which each target
@@ -212,6 +220,11 @@ class DeliveryJournal:
         # for a fresh scan. Tracks corrupt/unsupported entries so they are
         # never silently treated as absent (see JournalCorruptError).
         self._unreadable: list[str] = []
+        # Records whose recovery transition could not be durably written at
+        # startup (a DurabilityError during reconcile_on_start). Non-empty means
+        # startup could not establish clean state; the harness must refuse new
+        # injection (fail closed) rather than risk replaying an uncertain record.
+        self._reconcile_failures: list[str] = []
 
     @property
     def root(self) -> Path:
@@ -302,14 +315,28 @@ class DeliveryJournal:
         return record
 
     def get(self, delivery_id: str) -> DeliveryRecord | None:
+        """Return one record, or None if the entry does not exist.
+
+        Corruption (a malformed/unsupported record) is NOT absence: a
+        corrupt entry may hide an in-flight delivery, so JournalCorruptError
+        propagates rather than being converted to None. Only a genuine missing
+        entry or an OS read error returns None.
+        """
         path = self._path(delivery_id)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return _record_from_dict(data)
-        except (OSError, ValueError, JournalCorruptError):
+        except (OSError, ValueError):
             return None
+        return _record_from_dict(data)  # raises JournalCorruptError if corrupt
 
-    def load_all(self) -> list[DeliveryRecord]:
+    def _scan(self) -> tuple[list[DeliveryRecord], list[str]]:
+        """Read every entry, splitting good records from unreadable descriptions.
+
+        Unreadable (unparseable JSON or a corrupt/unsupported record) entries are
+        collected separately so callers can treat them as fail-closed state
+        rather than silently absent records. Good records are sorted by creation
+        time so the most recent record for a prompt is found first.
+        """
         records: list[DeliveryRecord] = []
         unreadable: list[str] = []
         if self._dir.is_dir():
@@ -324,10 +351,13 @@ class DeliveryJournal:
                 except JournalCorruptError as exc:
                     unreadable.append(f"{entry.name}: {exc}")
                     continue
-                if record is not None:
-                    records.append(record)
-        self._unreadable = unreadable
+                records.append(record)
         records.sort(key=lambda r: r.created_at)
+        return records, unreadable
+
+    def load_all(self) -> list[DeliveryRecord]:
+        records, unreadable = self._scan()
+        self._unreadable = unreadable
         return records
 
     def unreadable_records(self) -> list[str]:
@@ -339,20 +369,27 @@ class DeliveryJournal:
         refuse injection (recovery_required) rather than risk replaying it.
         Performs a fresh scan (independent of load_all()).
         """
-        unreadable: list[str] = []
-        if not self._dir.is_dir():
-            return unreadable
-        for entry in self._dir.glob("*.json"):
-            try:
-                data = json.loads(entry.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                unreadable.append(entry.name)
-                continue
-            try:
-                _record_from_dict(data)
-            except JournalCorruptError as exc:
-                unreadable.append(f"{entry.name}: {exc}")
+        _records, unreadable = self._scan()
         return unreadable
+
+    def ensure_clean(self) -> None:
+        """Raise if the journal holds ANY unreadable entry.
+
+        Every mutating/correlating operation must refuse to proceed while the
+        journal is corrupt: a skipped corrupt entry could hide an in-flight
+        delivery and let an unrelated singleton be confirmed (replay). Callers
+        that can surface a typed result (executor turns, server confirmation)
+        treat JournalCorruptError as fail-closed.
+        """
+        unreadable = self.unreadable_records()
+        if unreadable:
+            raise JournalCorruptError(
+                f"journal holds {len(unreadable)} unreadable record(s): {unreadable}"
+            )
+
+    def reconcile_failures(self) -> list[str]:
+        """Records whose recovery transition could not be written at startup."""
+        return list(self._reconcile_failures)
 
     def _transition(
         self,
@@ -454,6 +491,10 @@ class DeliveryJournal:
         """
         if expected_thread_id and not _response_id_matches_thread(response_id, expected_thread_id):
             return ConfirmationOutcome(confirmed=False, delivery_id=None, already_confirmed=False)
+        # Refuse to correlate while the journal is corrupt: a skipped unreadable
+        # entry could hide an in-flight delivery and let an unrelated singleton be
+        # confirmed (replay). Fail closed.
+        self.ensure_clean()
         records = self.load_all()
         already = any(
             r.state == DeliveryState.CONFIRMED.value and r.response_id == response_id
@@ -566,7 +607,15 @@ class DeliveryJournal:
                         updated_at=_clock(),
                         reason=f"restart interrupted delivery in {cur_state.value}",
                     )
-                    self._write_atomic(updated)
+                    try:
+                        self._write_atomic(updated)
+                    except DurabilityError as exc:
+                        # The recovery transition itself could not be persisted.
+                        # The record stays non-terminal; record this so the
+                        # harness fails closed (blocks injection) rather than
+                        # crashing or silently treating the record as resolved.
+                        self._reconcile_failures.append(f"{current.delivery_id}: {exc}")
+                        continue
                     recovered.append(updated)
         return recovered
 
@@ -590,9 +639,16 @@ def _safe_state(record: DeliveryRecord) -> DeliveryState | None:
         return None
 
 
-def _record_from_dict(data: dict[str, Any]) -> DeliveryRecord | None:
+def _record_from_dict(data: Any) -> DeliveryRecord:
+    """Parse one persisted record, raising JournalCorruptError on ANY bad shape.
+
+    A non-dict body, an unknown schema version, a missing field, a bad type, or
+    an invalid state enum value are ALL corruption (never absence): the record
+    could represent an in-flight delivery the loader cannot interpret, so it
+    must be surfaced and treated as fail-closed rather than silently skipped.
+    """
     if not isinstance(data, dict):
-        return None
+        raise JournalCorruptError("record is not a JSON object")
     try:
         schema_version = int(data.get("schema_version", SCHEMA_VERSION))
         if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
@@ -600,13 +656,18 @@ def _record_from_dict(data: dict[str, Any]) -> DeliveryRecord | None:
             # safely — surface it (raise) rather than silently dropping it,
             # which would hide a possible in-flight delivery and allow replay.
             raise JournalCorruptError(f"unsupported schema_version={schema_version}")
+        state = str(data["state"])
+        try:
+            DeliveryState(state)
+        except ValueError as exc:
+            raise JournalCorruptError(f"invalid state={state!r}") from exc
         return DeliveryRecord(
             schema_version=schema_version,
             delivery_id=str(data["delivery_id"]),
             conversation_id=data.get("conversation_id"),
             response_id=data.get("response_id"),
             normalized_content_hash=str(data["normalized_content_hash"]),
-            state=str(data["state"]),
+            state=state,
             created_at=float(data["created_at"]),
             updated_at=float(data["updated_at"]),
             attempts=int(data.get("attempts", 0)),

@@ -29,7 +29,6 @@ from omnigent.amp_native_bridge import (
 from omnigent.amp_native_delivery import (
     DeliveryJournal,
     DeliveryRecord,
-    DeliveryState,
     DurabilityError,
 )
 from omnigent.inner.executor import (
@@ -103,22 +102,30 @@ class AmpNativeExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
-    def _unreadable_block_reason(self) -> str | None:
-        """Return a typed recovery reason if the journal holds unreadable state.
+    def _recovery_block_reason(self) -> str | None:
+        """Typed recovery reason if the journal cannot establish clean state.
 
-        A corrupt or unsupported-schema record could represent an in-flight
-        delivery the loader can't interpret, so it must never be treated as
-        absent. Any unreadable entry blocks new injection entirely: the harness
-        refuses to paste (recovery_required) rather than risk replaying it.
+        Two fail-closed conditions block new injection: unreadable
+        (corrupt/unsupported-schema) entries that may hide an in-flight delivery,
+        and a durability failure while reconciling non-terminal records at
+        startup. Neither may be treated as resolved/absent — pasting against
+        uncertain state risks replaying a delivery.
         """
         unreadable = self._journal.unreadable_records()
-        if not unreadable:
-            return None
-        return (
-            f"[{RECOVERY_ERROR_CODE}] journal holds {len(unreadable)} unreadable "
-            "record(s) that may represent an in-flight delivery; new injection is "
-            "blocked until the journal is reconciled."
-        )
+        if unreadable:
+            return (
+                f"[{RECOVERY_ERROR_CODE}] journal holds {len(unreadable)} unreadable "
+                "record(s) that may represent an in-flight delivery; new injection is "
+                "blocked until the journal is reconciled."
+            )
+        failures = self._journal.reconcile_failures()
+        if failures:
+            return (
+                f"[{RECOVERY_ERROR_CODE}] startup reconciliation could not durably "
+                f"recover {len(failures)} non-terminal record(s); new injection is "
+                "blocked until the journal is reconciled."
+            )
+        return None
 
     def _mark_failed_safe(self, delivery_id: str, reason: str) -> None:
         """Persist a failed transition without letting its fsync escape raw.
@@ -154,23 +161,35 @@ class AmpNativeExecutor(Executor):
                 exc,
             )
 
-    def _recovery_record_for(self, text: str) -> str | None:
-        """Return the delivery_id of the most recent recovery record matching text.
+    def _blocking_reason_for(self, text: str) -> str | None:
+        """Typed recovery reason if a prior delivery of this prompt is unresolved.
 
-        A retry of a prompt whose prior delivery was interrupted (now
-        ``recovery_required``) must not be replayed. Matching is by the
-        paste-normalized content digest the journal stores, so whitespace/CRLF
-        variants of the same prompt are recognized as the same delivery.
+        A retry must NEVER replay a prompt whose delivery is non-terminal
+        (pending/submission_started — the paste may already have happened while
+        the process stayed alive) or already recovery_required. Matching is by
+        the paste-canonical content digest the journal stores and the owning
+        conversation, so only a confirmed/failed delivery (proven outcome / never
+        reached Amp) allows a new delivery for the same prompt.
         """
-        from omnigent.amp_native_delivery import normalized_content_hash
+        from omnigent.amp_native_delivery import (
+            _RETRY_BLOCKING_STATES,
+            normalized_content_hash,
+        )
 
         digest = normalized_content_hash(text)
+        blocking = {state.value for state in _RETRY_BLOCKING_STATES}
         for record in reversed(self._journal.load_all()):
-            if (
-                record.state == DeliveryState.RECOVERY_REQUIRED.value
-                and record.normalized_content_hash == digest
-            ):
-                return record.delivery_id
+            if record.normalized_content_hash != digest:
+                continue
+            if record.conversation_id not in (None, self._conversation_id):
+                continue
+            if record.state in blocking:
+                return (
+                    f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} is "
+                    f"{record.state} for this prompt; resubmission is blocked to "
+                    "avoid replay. Reconcile the Amp thread outcome or start a new "
+                    "conversation."
+                )
         return None
 
     async def enqueue_session_message(
@@ -187,18 +206,12 @@ class AmpNativeExecutor(Executor):
         text = _content_to_text(content)
         if not text:
             return LiveQueueResult(accepted=False, reason="empty message")
-        blocked = self._unreadable_block_reason()
+        blocked = self._recovery_block_reason()
         if blocked is not None:
             return LiveQueueResult(accepted=False, reason=blocked)
-        recovery_id = self._recovery_record_for(text)
-        if recovery_id is not None:
-            return LiveQueueResult(
-                accepted=False,
-                reason=(
-                    f"[{RECOVERY_ERROR_CODE}] delivery {recovery_id} was interrupted "
-                    "before confirmation; resubmission is blocked."
-                ),
-            )
+        in_flight = self._blocking_reason_for(text)
+        if in_flight is not None:
+            return LiveQueueResult(accepted=False, reason=in_flight)
         record: DeliveryRecord | None = None
         try:
             record = self._journal.create(content=text, conversation_id=self._conversation_id)
@@ -252,21 +265,15 @@ class AmpNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Amp native turn had no user text to send")
             return
-        blocked = self._unreadable_block_reason()
+        blocked = self._recovery_block_reason()
         if blocked is not None:
             yield ExecutorError(message=blocked)
             return
-        # A retry of an interrupted delivery must surface an actionable, typed
-        # result and never be automatically resubmitted.
-        recovery_id = self._recovery_record_for(text)
-        if recovery_id is not None:
-            yield ExecutorError(
-                message=(
-                    f"[{RECOVERY_ERROR_CODE}] delivery {recovery_id} for this prompt "
-                    "was interrupted before confirmation; resubmission is blocked. "
-                    "Reconcile the Amp thread outcome or start a new conversation."
-                )
-            )
+        # A retry of an in-flight or interrupted delivery must surface an
+        # actionable, typed result and never be automatically resubmitted.
+        in_flight = self._blocking_reason_for(text)
+        if in_flight is not None:
+            yield ExecutorError(message=in_flight)
             return
         record: DeliveryRecord | None = None
         try:

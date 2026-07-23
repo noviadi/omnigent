@@ -549,6 +549,156 @@ def test_unreadable_journal_blocks_new_injection(
     assert fake_tmux.enter_calls == 0
 
 
+def test_in_flight_submission_started_blocks_same_process_retry(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submission_started delivery (paste may have happened) blocks a same-
+    process retry: no second paste, typed recovery result."""
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+
+    # Simulate a delivery left in flight within the live process (e.g. a caller
+    # died after submission_started but before the recovery transition landed).
+    rec = executor.journal.create(content="in flight", conversation_id="conv_1")
+    executor.journal.mark_submission_started(rec.delivery_id)
+
+    events = asyncio.run(_drive_turn(executor, [{"role": "user", "content": "in flight"}]))
+    assert executor_module.RECOVERY_ERROR_CODE in " ".join(events)
+    # No second paste reached Amp.
+    assert fake_tmux.paste_calls == 0
+    assert fake_tmux.enter_calls == 0
+
+
+def test_pending_delivery_blocks_same_process_retry(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending (created but not yet submitted) delivery for the same prompt
+    also blocks a retry: at most one non-terminal delivery per prompt."""
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+
+    executor.journal.create(content="pending twin", conversation_id="conv_1")
+
+    events = asyncio.run(_drive_turn(executor, [{"role": "user", "content": "pending twin"}]))
+    assert executor_module.RECOVERY_ERROR_CODE in " ".join(events)
+    assert fake_tmux.paste_calls == 0
+
+
+def test_failed_delivery_allows_new_attempt_for_same_prompt(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed delivery (no byte reached Amp) has a proven outcome and a retry
+    of the same prompt may create a new delivery and paste."""
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+
+    rec = executor.journal.create(content="try again", conversation_id="conv_1")
+    executor.journal.mark_failed(rec.delivery_id, reason="pre-paste failure")
+
+    outcome = asyncio.run(executor.enqueue_session_message("main", "try again"))
+    assert bool(outcome) is True
+    assert fake_tmux.paste_calls == 1
+
+
+def test_reconcile_durability_failure_surfaces_typed_recovery(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An fsync failure during startup reconcile must surface as a typed recovery
+    result — no raw stack trace, no paste."""
+    from omnigent.amp_native_delivery import DeliveryJournal
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+
+    # A non-terminal record exists so reconcile_on_start attempts a write.
+    journal = DeliveryJournal(bridge)
+    journal.create(content="left mid-flight", conversation_id="conv_1")
+    journal.mark_submission_started(journal.load_all()[0].delivery_id)
+
+    # The recovery-transition fsync fails during startup reconcile.
+    def _boom_fsync(_fd: int) -> None:
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr("omnigent.amp_native_delivery.os.fsync", _boom_fsync)
+
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+    assert executor.journal.reconcile_failures()
+
+    # New injection must be refused without raising and without pasting.
+    outcome = asyncio.run(executor.enqueue_session_message("main", "unrelated prompt"))
+    assert bool(outcome) is False
+    assert outcome.reason is not None
+    assert executor_module.RECOVERY_ERROR_CODE in outcome.reason
+    assert fake_tmux.paste_calls == 0
+
+
+def test_strict_parsing_rejects_non_dict_record(tmp_path: Path) -> None:
+    """A non-JSON-object record body is corruption, not absence."""
+    import json
+
+    from omnigent.amp_native_delivery import JournalCorruptError
+
+    journal = DeliveryJournal(tmp_path / "bridge")
+    record = journal.create(content="x", conversation_id="conv_1")
+    path = tmp_path / "bridge" / "delivery" / f"{record.delivery_id}.json"
+    path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    with pytest.raises(JournalCorruptError, match="not a JSON object"):
+        journal.get(record.delivery_id)
+    assert journal.unreadable_records()
+
+
+def test_strict_parsing_rejects_invalid_state(tmp_path: Path) -> None:
+    """An invalid state enum value is corruption, not a silently accepted record."""
+    import json
+
+    from omnigent.amp_native_delivery import JournalCorruptError
+
+    journal = DeliveryJournal(tmp_path / "bridge")
+    record = journal.create(content="x", conversation_id="conv_1")
+    path = tmp_path / "bridge" / "delivery" / f"{record.delivery_id}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["state"] = "bogus_state"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(JournalCorruptError, match="invalid state"):
+        journal.get(record.delivery_id)
+    assert journal.unreadable_records()
+
+
+def test_confirm_outstanding_refuses_when_journal_corrupt(tmp_path: Path) -> None:
+    """Confirmation must not proceed (or pick a singleton) while the journal holds
+    a corrupt record — fail closed rather than risk confirming the wrong delivery."""
+    import json
+
+    from omnigent.amp_native_delivery import JournalCorruptError
+
+    journal = DeliveryJournal(tmp_path / "bridge")
+    good = journal.create(content="the real prompt", conversation_id="T-1")
+    journal.mark_submission_started(good.delivery_id)
+    # An unrelated corrupt entry exists alongside the good outstanding delivery.
+    corrupt = journal.create(content="other", conversation_id="T-1")
+    bad_path = tmp_path / "bridge" / "delivery" / f"{corrupt.delivery_id}.json"
+    bad_data = json.loads(bad_path.read_text(encoding="utf-8"))
+    bad_data["schema_version"] = 99
+    bad_path.write_text(json.dumps(bad_data), encoding="utf-8")
+
+    with pytest.raises(JournalCorruptError):
+        journal.confirm_outstanding(
+            response_id="T-1:ev_1",
+            expected_thread_id="T-1",
+            confirmed_item_id="item_1",
+            content="the real prompt",
+        )
+    # The good delivery was NOT confirmed while the journal was corrupt.
+    assert journal.get(good.delivery_id).state == DeliveryState.SUBMISSION_STARTED.value
+
+
 # --------------------------------------------------------------------------- #
 # Terminal-recreate survival + runner reconciliation
 # --------------------------------------------------------------------------- #
@@ -1043,13 +1193,17 @@ def test_journal_rejects_unknown_schema_version(tmp_path: Path) -> None:
     with the current shape and is SURFACED (never silently dropped)."""
     import json
 
+    from omnigent.amp_native_delivery import JournalCorruptError
+
     journal = DeliveryJournal(tmp_path / "bridge")
     record = journal.create(content="x", conversation_id="conv_1")
     path = tmp_path / "bridge" / "delivery" / f"{record.delivery_id}.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     data["schema_version"] = 99  # unknown future version
     path.write_text(json.dumps(data), encoding="utf-8")
-    assert journal.get(record.delivery_id) is None
+    # get() propagates corruption (never treats it as absence).
+    with pytest.raises(JournalCorruptError, match="unsupported schema_version"):
+        journal.get(record.delivery_id)
     assert journal.load_all() == []
     # The unreadable record is surfaced, not treated as absent (no silent replay).
     assert journal.unreadable_records()
