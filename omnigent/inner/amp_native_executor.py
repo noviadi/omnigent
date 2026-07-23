@@ -40,6 +40,11 @@ class AmpNativeExecutor(Executor):
         self._bridge_dir = bridge_dir or (Path(raw) if raw else None)
         if self._bridge_dir is None:
             raise RuntimeError(f"{AMP_NATIVE_BRIDGE_DIR_ENV_VAR} is required")
+        # Serializes delivery so a concurrent run_turn (initiating message) and
+        # enqueue_session_message (mid-turn steer, live message queue) don't
+        # paste into the shared TUI at once or interleave on the shared
+        # pending_delivery.json token channel.
+        self._send_lock = asyncio.Lock()
 
     def supports_streaming(self) -> bool:
         return False
@@ -53,7 +58,8 @@ class AmpNativeExecutor(Executor):
         if not text:
             return False
         try:
-            await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
+            async with self._send_lock:
+                await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
         except RuntimeError:
             return False
         return True
@@ -78,7 +84,8 @@ class AmpNativeExecutor(Executor):
             yield ExecutorError(message="Amp native turn had no user text to send")
             return
         try:
-            await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
+            async with self._send_lock:
+                await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return

@@ -261,6 +261,11 @@ def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
     _write_pending_delivery(path, token)
     _clear_turn_started(path)
     for _ in range(_MAX_SUBMIT_ATTEMPTS):
+        # Re-check before each Enter so a matching signal that lagged past the
+        # prior window short-circuits instead of pressing another Enter. NOTE:
+        # the check->send window between this confirm and send-keys is an
+        # accepted parity-level residual (mirrors antigravity's check-then-act
+        # residual; see AMP-NATIVE-0-2 non-goals).
         if _confirm_turn_started(path, token):
             return
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -18,7 +20,8 @@ from omnigent.harness_aliases import (
     native_terminal_name,
 )
 from omnigent.harness_plugins import AMP_NATIVE_CODING_AGENT, harness_capabilities
-from omnigent.inner.amp_native_executor import _content_to_text
+from omnigent.inner import amp_native_executor as amp_native_executor_module
+from omnigent.inner.amp_native_executor import AmpNativeExecutor, _content_to_text
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.onboarding.harness_install import AMP_KEY, required_cli_for_harness
 
@@ -414,3 +417,38 @@ def test_submit_budget_exhausted_raises_runtime_error(
         amp_native_bridge.inject_user_message(bridge, "hello from browser")
 
     assert fake.enters == 3  # invariant 4: loud failure, never silent
+
+
+def test_executor_serializes_concurrent_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Concurrent deliveries (e.g. a run_turn + an enqueue_session_message) share
+    # the TUI paste and the pending_delivery.json token channel, so per-executor
+    # delivery must be serialized — mirroring AntigravityNativeExecutor._send_lock.
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    state: dict[str, int] = {"in_flight": 0, "max_in_flight": 0}
+    guard = threading.Lock()
+
+    def fake_inject(_path: Path, content: str) -> None:
+        with guard:
+            state["in_flight"] += 1
+            state["max_in_flight"] = max(state["max_in_flight"], state["in_flight"])
+        time.sleep(0.05)  # widen the window so any overlap would be observable
+        with guard:
+            state["in_flight"] -= 1
+
+    monkeypatch.setattr(amp_native_executor_module, "inject_user_message", fake_inject)
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+
+    async def main() -> None:
+        await asyncio.gather(
+            executor.enqueue_session_message("s", "first"),
+            executor.enqueue_session_message("s", "second"),
+        )
+
+    asyncio.run(main())
+
+    # The two deliveries never ran concurrently (no interleaving on the TUI /
+    # token channel). Without the per-executor send lock this would be 2.
+    assert state["max_in_flight"] == 1
