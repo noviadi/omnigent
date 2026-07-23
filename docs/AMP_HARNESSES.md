@@ -40,6 +40,13 @@ not open tmux, depend on the interactive plugin bridge, or require the
 third-party ACP adapter. The two surfaces solve different use cases and should
 coexist rather than forcing one lifecycle model onto both.
 
+Here, "direct" or "headless" means a request/response execute process. Amp's
+persistent `amp --no-tui` Agents Anywhere client is also non-interactive, but
+it is a different lifecycle: it is workdir-bound, does not own one remote
+thread, and stays alive to receive remote work. If Omnigent manages that mode
+later, it should be a third `amp-runner`-style surface rather than an
+implementation of the direct harness.
+
 ## Goals and non-goals
 
 ### MVP goals
@@ -422,7 +429,7 @@ metadata around the synchronous call. This keeps the MVP small and functional,
 but a follow-up should extract a vendor-neutral native terminal wrapper helper
 instead of sharing transport through Pi's module-level identifiers.
 
-## Planned direct/non-interactive Amp harness
+## Planned direct/headless Amp harness
 
 ### Recommendation
 
@@ -466,6 +473,14 @@ later optimization for live input, but it introduces ambiguous turn
 boundaries, recovery after process loss, backpressure, and cancellation
 semantics before the basic execute/resume contract is qualified.
 
+Do not substitute `amp --no-tui` for this design. That command runs a
+persistent Agents Anywhere client whose canonical identity is its working
+directory and whose remote agent threads remain Amp-owned. It has no
+per-Omnigent-turn stdin, stream-result, or semantic completion boundary. If
+Omnigent later manages persistent runners, register and document that as a
+separate workdir-bound lifecycle rather than conflating it with this
+thread-bound execute harness.
+
 ### Proposed runtime data flow
 
 ```diagram
@@ -503,6 +518,45 @@ has been established. Transcript replay is a separate fork/import feature and
 must not be mixed into ordinary resume. Fresh conversations created from an
 existing non-Amp transcript need an explicit import policy before they are
 supported.
+
+### Turn serialization and recovery journal
+
+Only one execute turn may mutate a given Amp thread at a time. Use a
+per-conversation lock before the first identity is known and a per-thread lock
+after binding; independent Amp threads remain concurrent. A second prompt for
+the same thread must be queued or rejected according to an explicit capability
+contract, never launched concurrently.
+
+Persist turn intent before stdin can reach Amp. The minimum durable state model
+is:
+
+```diagram
+pending
+   │ process launched
+   ▼
+submission_started
+   │ prompt written and stdin closed
+   ▼
+submitted
+   │ terminal result and child tree reaped
+   ▼
+completed | cancelled | failed | recovery_required
+```
+
+The journal should include a stable turn ID, canonical Amp thread ID when
+known, prompt digest rather than prompt contents, process lifecycle phase,
+first/last valid stream record type, cancellation intent, terminal outcome,
+and bounded sanitized diagnostics. Persist `submission_started` before writing
+any prompt bytes. Once that state is durable, automatic replay is forbidden:
+Amp may have committed the prompt or executed tools even if the local process
+exits without a terminal record.
+
+On harness or runner restart, `pending` work with no launched process may be
+retried safely. `submission_started` or `submitted` work without a proven
+terminal outcome becomes `recovery_required`. Continuation of that Amp thread
+must remain blocked until an explicit reconciliation path proves the remote
+outcome or the user chooses a documented recovery action. Local cancellation
+that cannot prove remote cancellation follows the same rule.
 
 ### Stream normalization contract
 
@@ -654,6 +708,8 @@ on the same machine.
 | Errors | Bridge/plugin status | Reconcile result records, exit code, signal, malformed JSON, and stderr |
 | Timeouts | Long-lived terminal lifecycle | Per-turn startup, inactivity, and total-runtime behavior |
 | Retry | Interactive thread remains resident | Prevent automatic replay after partial output or side effects |
+| Turn concurrency | Resident TUI serializes composer activity | Serialize execute processes per conversation/Amp thread |
+| Recovery journal | Bridge and launch snapshot | Persist intent before stdin; reconcile uncertain submitted turns |
 | Schema compatibility | Plugin event API | Minimum Amp version plus tolerant stream-schema parser |
 | Tests | Interactive bridge, argv, tmux, plugin contract | Recorded fixtures, fake executable, lifecycle, authenticated smoke test |
 | ACP coexistence | External experimental route | Decide whether ACP remains an optional compatibility path |
@@ -681,7 +737,10 @@ on the same machine.
 4. Emit text, final status, usage, and errors with exactly one terminal event.
 5. Reap the complete process tree on success, cancellation, timeout, or parse
    failure using the shared cross-platform lifecycle helpers.
-6. Keep this prototype unregistered and internal until Phase 2's continuity,
+6. Serialize processes per conversation and persist a minimal turn journal
+   before writing stdin; never automatically replay an uncertain submitted
+   turn.
+7. Keep this prototype unregistered and internal until Phase 2's continuity,
    prompt, input, and execution-safety gates are complete.
 
 #### Phase 2: first releasable direct harness
@@ -698,9 +757,12 @@ on the same machine.
    publish the fact that Amp-owned tools bypass Omnigent policy until bridged.
 6. Disable automatic retries once the prompt has been handed to Amp because it
    may already have performed side effects or committed the turn remotely.
-7. Register the chosen harness ID with accurate streaming, live-queue, model,
+7. Restore the durable turn journal after harness and runner restart, block
+   threads with uncertain submitted turns, and provide an explicit
+   reconciliation path.
+8. Register the chosen harness ID with accurate streaming, live-queue, model,
    tool, attachment, terminal, and policy capability metadata.
-8. Define explicit fresh, resume, fork, and cross-harness import semantics.
+9. Define explicit fresh, resume, fork, and cross-harness import semantics.
 
 #### Phase 3: Omnigent tools and policy parity
 
@@ -742,27 +804,39 @@ The direct harness is ready for initial release when:
    every run after the complete child tree has been reaped;
 5. a validated Amp thread ID survives both Amp child exit and harness-process
    restart, then is used for the next turn without replaying prior history;
-6. cancellation and timeout use cross-platform tree termination; an
+6. only one execute process can mutate a conversation or Amp thread at a time,
+   while independent threads remain concurrent;
+7. turn intent is durable before stdin submission, and restart never
+   automatically replays a prompt whose submission or remote effects are
+   uncertain;
+8. cancellation and timeout use cross-platform tree termination; an
    inconclusive remote cancellation blocks continuation as recovery-required;
-7. malformed, truncated, or oversized output fails clearly without exposing
+9. malformed, truncated, or oversized output fails clearly without exposing
    secrets, and documentation does not claim failed partial text is durable;
-8. the complete agent/framework prompt reaches Amp through a verified additive
+10. the complete agent/framework prompt reaches Amp through a verified additive
    settings mechanism without changing the user's settings;
-9. the requested `OSEnvSpec` applies to the whole process tree or launch fails
+11. the requested `OSEnvSpec` applies to the whole process tree or launch fails
    closed, with Amp-owned tool and policy limitations advertised accurately;
-10. Amp-native tool observations are never executed a second time by Omnigent;
-11. `--no-ide`, remote-terminal disabling, private config files, and an
+12. Amp-native tool observations are never executed a second time by Omnigent;
+13. `--no-ide`, remote-terminal disabling, private config files, and an
     explicit child-environment policy prevent ambient context leakage;
-12. direct and `amp-native` conversations run concurrently without plugin,
+14. direct and `amp-native` conversations run concurrently without plugin,
    config, process, or thread identity cross-talk;
-13. executable overrides, authentication failures, unsupported versions,
+15. executable overrides, authentication failures, unsupported versions,
     nonzero exits, and stderr diagnostics produce actionable messages;
-14. fixture/fake-process tests pass without Amp credentials, and an
+16. fixture/fake-process tests pass without Amp credentials, and an
     authenticated end-to-end qualification passes against the minimum and
     current supported Amp versions;
-15. existing `amp-native` behavior and tests remain unchanged.
+17. existing `amp-native` behavior and tests remain unchanged;
+18. the harness uses `--execute --stream-json`, never tmux or `--no-tui`, and
+    documentation keeps persistent workdir-bound runners as a separate
+    lifecycle.
 
 ## Interactive `amp-native` follow-up plan
+
+The prioritized reliability work, with per-task definitions of done, is tracked
+in [`AMP_HARNESSES_TASK.md`](AMP_HARNESSES_TASK.md). The roadmap below covers
+broader qualification, refactoring, and feature-parity work.
 
 ### Priority 1: manual end-to-end qualification
 
