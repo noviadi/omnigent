@@ -699,6 +699,112 @@ def test_confirm_outstanding_refuses_when_journal_corrupt(tmp_path: Path) -> Non
     assert journal.get(good.delivery_id).state == DeliveryState.SUBMISSION_STARTED.value
 
 
+def test_cross_process_prompt_claim_pastes_at_most_once(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two separate executors attempting the same prompt paste exactly once.
+
+    The per-(conversation, prompt) fcntl flock (one descriptor per caller, so it
+    serializes across processes AND threads) makes scan+create+paste atomic: the
+    second caller, having serialized behind the first, observes its non-terminal
+    delivery and refuses (recovery_required) instead of creating a second one.
+    """
+    import threading
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+    start = threading.Barrier(4)
+
+    def _attempt() -> None:
+        try:
+            executor = AmpNativeExecutor(bridge_dir=bridge)
+            start.wait()  # release all callers together to maximize the race
+            results.append(asyncio.run(executor.enqueue_session_message("main", "same prompt")))
+        except BaseException as exc:  # pragma: no cover - unexpected
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_attempt) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    accepted = [r for r in results if bool(r)]
+    refused = [r for r in results if not bool(r)]
+    assert len(accepted) == 1
+    assert len(refused) == 3
+    assert all(executor_module.RECOVERY_ERROR_CODE in getattr(r, "reason", "") for r in refused)
+    assert fake_tmux.paste_calls == 1
+    assert fake_tmux.enter_calls == 1
+
+
+def test_hot_recreate_reconcile_failure_blocks_active_path(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconcile durability failure recorded by a hot recreate (separate
+    journal/process) is durable: the active executor blocks subsequent injection
+    with a typed recovery result, no paste."""
+    from omnigent.amp_native_delivery import DeliveryJournal
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+
+    active = AmpNativeExecutor(bridge_dir=bridge)  # clean startup
+
+    # A non-terminal record exists; the recreate's reconcile fails to persist
+    # its recovery transition (fsync down) and records the failure durably.
+    recreate = DeliveryJournal(bridge)
+    rec = recreate.create(content="left mid-flight", conversation_id="conv_1")
+    recreate.mark_submission_started(rec.delivery_id)
+
+    def _boom_fsync(_fd: int) -> None:
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr("omnigent.amp_native_delivery.os.fsync", _boom_fsync)
+    recreate.reconcile_on_start()
+    assert recreate.reconcile_failures()
+
+    # The active executor (separate instance) reads the durable marker and blocks.
+    outcome = asyncio.run(active.enqueue_session_message("main", "unrelated prompt"))
+    assert bool(outcome) is False
+    assert outcome.reason is not None
+    assert executor_module.RECOVERY_ERROR_CODE in outcome.reason
+    assert fake_tmux.paste_calls == 0
+
+
+def test_corrupt_json_record_blocks_injection(
+    fake_tmux: _FakeTmux, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncated/corrupt-JSON record file is corruption, not absence: get()
+    raises JournalCorruptError and injection is blocked (recovery, no paste)."""
+    from omnigent.amp_native_delivery import JournalCorruptError
+
+    bridge = fake_tmux.bridge
+    monkeypatch.setenv(executor_module.AMP_NATIVE_BRIDGE_DIR_ENV_VAR, str(bridge))
+    monkeypatch.setenv(executor_module.AMP_NATIVE_REQUEST_SESSION_ID_ENV_VAR, "conv_1")
+    journal = DeliveryJournal(bridge)
+    rec = journal.create(content="truncated", conversation_id="conv_1")
+    (bridge / "delivery" / f"{rec.delivery_id}.json").write_text(
+        "{ this is not valid json", encoding="utf-8"
+    )
+
+    with pytest.raises(JournalCorruptError, match="unreadable JSON"):
+        journal.get(rec.delivery_id)
+    assert journal.unreadable_records()
+
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+    events = asyncio.run(_drive_turn(executor, [{"role": "user", "content": "anything"}]))
+    assert executor_module.RECOVERY_ERROR_CODE in " ".join(events)
+    assert fake_tmux.paste_calls == 0
+    assert fake_tmux.enter_calls == 0
+
+
 # --------------------------------------------------------------------------- #
 # Terminal-recreate survival + runner reconciliation
 # --------------------------------------------------------------------------- #

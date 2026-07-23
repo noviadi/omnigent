@@ -13,6 +13,7 @@ typed result instead of a blind replay.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -209,41 +210,50 @@ class AmpNativeExecutor(Executor):
         blocked = self._recovery_block_reason()
         if blocked is not None:
             return LiveQueueResult(accepted=False, reason=blocked)
-        in_flight = self._blocking_reason_for(text)
-        if in_flight is not None:
-            return LiveQueueResult(accepted=False, reason=in_flight)
-        record: DeliveryRecord | None = None
+        # Hold an exclusive cross-process lock for this (conversation, prompt)
+        # across scan -> create -> submission_started -> paste so two processes
+        # cannot both observe no existing delivery and both create one. The flock
+        # is acquired in a worker thread so a contended acquire cannot block the
+        # event loop (or deadlock within one process).
+        lock_fd = self._journal.open_prompt_lock(self._conversation_id, text)
         try:
-            record = self._journal.create(content=text, conversation_id=self._conversation_id)
-            await asyncio.to_thread(
-                inject_user_message,
-                self._bridge_dir,
-                text,
-                journal=self._journal,
-                delivery_id=record.delivery_id,
-            )
-        except InjectionPreconditionError as exc:
-            # No byte reached Amp: safe to mark failed and let a retry proceed.
-            self._mark_failed_safe(record.delivery_id, reason=str(exc))
-            return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
-        except DurabilityError as exc:
-            # A durable write (create or submission_started) failed before any
-            # byte could reach Amp: treat as a safe pre-mutation failure. The
-            # record may not exist (create failed) or may be pending (the
-            # submission_started fsync failed), so mark_failed only when it does.
-            if record is not None:
+            await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+            in_flight = self._blocking_reason_for(text)
+            if in_flight is not None:
+                return LiveQueueResult(accepted=False, reason=in_flight)
+            record: DeliveryRecord | None = None
+            try:
+                record = self._journal.create(content=text, conversation_id=self._conversation_id)
+                await asyncio.to_thread(
+                    inject_user_message,
+                    self._bridge_dir,
+                    text,
+                    journal=self._journal,
+                    delivery_id=record.delivery_id,
+                )
+            except InjectionPreconditionError as exc:
+                # No byte reached Amp: safe to mark failed and let a retry proceed.
                 self._mark_failed_safe(record.delivery_id, reason=str(exc))
-            return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
-        except RuntimeError as exc:
-            # A mutation may have reached Amp: never ``failed`` (replayable).
-            self._mark_recovery_safe(record.delivery_id, reason=str(exc))
-            return LiveQueueResult(
-                accepted=False,
-                reason=(
-                    f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
-                    "interrupted after submission started; resubmission is blocked."
-                ),
-            )
+                return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
+            except DurabilityError as exc:
+                # A durable write (create or submission_started) failed before any
+                # byte could reach Amp: a safe pre-mutation failure. The record
+                # may not exist (create failed), so mark_failed only when it does.
+                if record is not None:
+                    self._mark_failed_safe(record.delivery_id, reason=str(exc))
+                return LiveQueueResult(accepted=False, reason=f"[{FAILED_ERROR_CODE}] {exc}")
+            except RuntimeError as exc:
+                # A mutation may have reached Amp: never ``failed`` (replayable).
+                self._mark_recovery_safe(record.delivery_id, reason=str(exc))
+                return LiveQueueResult(
+                    accepted=False,
+                    reason=(
+                        f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
+                        "interrupted after submission started; resubmission is blocked."
+                    ),
+                )
+        finally:
+            self._journal.close_prompt_lock(lock_fd)
         return LiveQueueResult(accepted=True)
 
     async def run_turn(
@@ -269,49 +279,59 @@ class AmpNativeExecutor(Executor):
         if blocked is not None:
             yield ExecutorError(message=blocked)
             return
-        # A retry of an in-flight or interrupted delivery must surface an
-        # actionable, typed result and never be automatically resubmitted.
-        in_flight = self._blocking_reason_for(text)
-        if in_flight is not None:
-            yield ExecutorError(message=in_flight)
-            return
-        record: DeliveryRecord | None = None
+        # Hold an exclusive cross-process lock for this (conversation, prompt)
+        # across scan -> create -> submission_started -> paste so two processes
+        # cannot both observe no existing delivery and both create one. The flock
+        # is acquired in a worker thread so a contended acquire cannot block the
+        # event loop (or deadlock within one process).
+        lock_fd = self._journal.open_prompt_lock(self._conversation_id, text)
         try:
-            record = self._journal.create(content=text, conversation_id=self._conversation_id)
-            await asyncio.to_thread(
-                inject_user_message,
-                self._bridge_dir,
-                text,
-                journal=self._journal,
-                delivery_id=record.delivery_id,
-                hooks=self._injection_hooks(),
-            )
-        except InjectionPreconditionError as exc:
-            # Pre-paste failure: no byte could have reached Amp, so the record
-            # may safely become ``failed`` (a retry can create a new delivery).
-            self._mark_failed_safe(record.delivery_id, reason=str(exc))
-            yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
-            return
-        except DurabilityError as exc:
-            # A durable write failed before any byte could reach Amp: a safe
-            # pre-mutation failure. The record may not exist (create failed),
-            # so only mark_failed when it was persisted.
-            if record is not None:
-                self._mark_failed_safe(record.delivery_id, reason=str(exc))
-            yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
-            return
-        except RuntimeError as exc:
-            # Post-mutation failure: Amp may have received the prompt, so this
-            # must become ``recovery_required`` — never ``failed`` (replayable).
-            self._mark_recovery_safe(record.delivery_id, reason=str(exc))
-            yield ExecutorError(
-                message=(
-                    f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
-                    "interrupted after submission started; resubmission is blocked. "
-                    "Reconcile the Amp thread outcome or start a new conversation."
+            await asyncio.to_thread(fcntl.flock, lock_fd, fcntl.LOCK_EX)
+            # A retry of an in-flight or interrupted delivery must surface an
+            # actionable, typed result and never be automatically resubmitted.
+            in_flight = self._blocking_reason_for(text)
+            if in_flight is not None:
+                yield ExecutorError(message=in_flight)
+                return
+            record: DeliveryRecord | None = None
+            try:
+                record = self._journal.create(content=text, conversation_id=self._conversation_id)
+                await asyncio.to_thread(
+                    inject_user_message,
+                    self._bridge_dir,
+                    text,
+                    journal=self._journal,
+                    delivery_id=record.delivery_id,
+                    hooks=self._injection_hooks(),
                 )
-            )
-            return
+            except InjectionPreconditionError as exc:
+                # Pre-paste failure: no byte could have reached Amp, so the record
+                # may safely become ``failed`` (a retry can create a new delivery).
+                self._mark_failed_safe(record.delivery_id, reason=str(exc))
+                yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
+                return
+            except DurabilityError as exc:
+                # A durable write failed before any byte could reach Amp: a safe
+                # pre-mutation failure. The record may not exist (create failed),
+                # so only mark_failed when it was persisted.
+                if record is not None:
+                    self._mark_failed_safe(record.delivery_id, reason=str(exc))
+                yield ExecutorError(message=f"[{FAILED_ERROR_CODE}] {exc}")
+                return
+            except RuntimeError as exc:
+                # Post-mutation failure: Amp may have received the prompt, so this
+                # must become ``recovery_required`` — never ``failed`` (replayable).
+                self._mark_recovery_safe(record.delivery_id, reason=str(exc))
+                yield ExecutorError(
+                    message=(
+                        f"[{RECOVERY_ERROR_CODE}] delivery {record.delivery_id} was "
+                        "interrupted after submission started; resubmission is blocked. "
+                        "Reconcile the Amp thread outcome or start a new conversation."
+                    )
+                )
+                return
+        finally:
+            self._journal.close_prompt_lock(lock_fd)
         yield TurnComplete(response=None)
 
     def _injection_hooks(self) -> InjectionHooks | None:

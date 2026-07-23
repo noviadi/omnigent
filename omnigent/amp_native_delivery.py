@@ -43,6 +43,7 @@ terminal recreation) cannot wipe delivery state.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import fcntl
 import hashlib
@@ -317,16 +318,22 @@ class DeliveryJournal:
     def get(self, delivery_id: str) -> DeliveryRecord | None:
         """Return one record, or None if the entry does not exist.
 
-        Corruption (a malformed/unsupported record) is NOT absence: a
-        corrupt entry may hide an in-flight delivery, so JournalCorruptError
-        propagates rather than being converted to None. Only a genuine missing
-        entry or an OS read error returns None.
+        Corruption (a malformed/unsupported/truncated record) is NOT absence:
+        a corrupt entry may hide an in-flight delivery, so a JSON decode failure
+        raises JournalCorruptError rather than returning None. Only a genuinely
+        missing entry returns None.
         """
         path = self._path(delivery_id)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise JournalCorruptError(
+                f"unreadable JSON for delivery {delivery_id}: {exc}"
+            ) from exc
         return _record_from_dict(data)  # raises JournalCorruptError if corrupt
 
     def _scan(self) -> tuple[list[DeliveryRecord], list[str]]:
@@ -388,8 +395,99 @@ class DeliveryJournal:
             )
 
     def reconcile_failures(self) -> list[str]:
-        """Records whose recovery transition could not be written at startup."""
-        return list(self._reconcile_failures)
+        """Recovery transitions that could not be written, read fresh each call.
+
+        The set is durable (a marker in the delivery dir) so a reconcile
+        durability failure recorded by a HOT RECREATE in a separate process —
+        which builds its own journal and would otherwise discard the failure —
+        is seen by the active executor before every injection. Merged with this
+        instance's own in-memory failures.
+        """
+        failures: list[str] = list(self._reconcile_failures)
+        try:
+            data = json.loads(self._reconcile_failures_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return failures
+        if isinstance(data, dict) and isinstance(data.get("failures"), list):
+            for item in data["failures"]:
+                if isinstance(item, str) and item not in failures:
+                    failures.append(item)
+        return failures
+
+    def _reconcile_failures_path(self) -> Path:
+        return self._dir / ".reconcile_failures.json"
+
+    def _persist_reconcile_failures(self, failures: list[str]) -> None:
+        """Best-effort durable record of the current reconcile-failure set.
+
+        The disk may already be failing (that is why a recovery write failed),
+        so this is best-effort: os.replace without a hard fsync requirement and
+        all errors swallowed. It only needs to survive the hot-recreate boundary
+        to a separate process; the active executor re-runs reconcile on its own
+        startup. An empty set clears the marker so a successful reconcile stops
+        blocking injection.
+        """
+        path = self._reconcile_failures_path()
+        try:
+            if not failures:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                return
+            self._ensure_dir()
+            fd, temporary = tempfile.mkstemp(dir=self._dir, prefix=".reconcile.", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump({"failures": failures}, handle)
+                    handle.flush()
+                    with contextlib.suppress(OSError):
+                        os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                temporary = None
+            finally:
+                if temporary is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(temporary)
+        except OSError:
+            pass  # disk too broken to record; the active executor's own reconcile is the backstop
+
+    def open_prompt_lock(self, conversation_id: str | None, content: str) -> int:
+        """Open (create) the per-(conversation, prompt) lock file; return its fd.
+
+        The caller takes an exclusive ``fcntl`` flock on the fd — preferably via a
+        worker thread so a contended acquire cannot block an event loop — holds it
+        across the scan -> create -> submission_started -> paste critical section,
+        then calls :meth:`close_prompt_lock`. Keyed by the owning conversation and
+        the paste-canonical content digest. Each caller opens its own descriptor,
+        so the flock serializes across processes AND threads (two descriptors on
+        the same lock file conflict).
+        """
+        self._ensure_dir()
+        digest = normalized_content_hash(content)
+        key = hashlib.sha256(f"{conversation_id or ''}\0{digest}".encode()).hexdigest()
+        lock_path = self._dir / f".prompt.{key}.flock"
+        return os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+
+    @staticmethod
+    def close_prompt_lock(fd: int) -> None:
+        """Release the exclusive flock and close the fd (idempotent on release)."""
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    @contextmanager
+    def prompt_lock(self, conversation_id: str | None, content: str):
+        """Sync exclusive lock for one (conversation, prompt) (tests/sync callers).
+
+        Acquires a blocking ``fcntl`` flock; do NOT use inside an event loop where
+        contention could block it — async callers use :meth:`open_prompt_lock` and
+        acquire the flock via a worker thread.
+        """
+        fd = self.open_prompt_lock(conversation_id, content)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            self.close_prompt_lock(fd)
 
     def _transition(
         self,
@@ -584,6 +682,7 @@ class DeliveryJournal:
         (confirmed/failed/recovery_required) are never regressed.
         """
         recovered: list[DeliveryRecord] = []
+        failures: list[str] = []
         for record in self.load_all():
             try:
                 state = DeliveryState(record.state)
@@ -611,12 +710,17 @@ class DeliveryJournal:
                         self._write_atomic(updated)
                     except DurabilityError as exc:
                         # The recovery transition itself could not be persisted.
-                        # The record stays non-terminal; record this so the
-                        # harness fails closed (blocks injection) rather than
-                        # crashing or silently treating the record as resolved.
-                        self._reconcile_failures.append(f"{current.delivery_id}: {exc}")
+                        # The record stays non-terminal; record this (durably,
+                        # so a hot recreate in another process surfaces it too)
+                        # so the harness fails closed rather than crashing or
+                        # silently treating the record as resolved.
+                        failures.append(f"{current.delivery_id}: {exc}")
                         continue
                     recovered.append(updated)
+        # Persist the current failure set so the active executor (and any hot
+        # recreate in a separate process) blocks injection until it is resolved.
+        self._reconcile_failures = failures
+        self._persist_reconcile_failures(failures)
         return recovered
 
     def has_outstanding_delivery(self) -> bool:
