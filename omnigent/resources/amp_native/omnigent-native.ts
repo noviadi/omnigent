@@ -17,6 +17,30 @@ export default function omnigentNative(amp: PluginAPI): void {
   let managedThreadID: ThreadID | undefined;
   let activeResponseID: string | undefined;
   const responseID = (event: AmpEvent): string => `${String(managedThreadID)}:${event.id ?? "event"}`;
+  // Local turn-started marker for the delivery path's submit-verify loop. The
+  // bridge dir is the parent of the inbox dir it already polls, so no new config
+  // field is needed. The marker is correlated to a specific delivery by a nonce
+  // the bridge publishes (pending_delivery.json) so a stale marker or a delayed
+  // previous-turn write cannot false-confirm. The token is captured and the
+  // marker written BEFORE any awaited POST, so a slow prior handler can't adopt
+  // a newer token and the signal is timely. Mirrors the interrupt inbox's
+  // file-IPC; not a new plugin event type.
+  const bridgeDir = path.dirname(config.inboxDir);
+  const pendingDeliveryPath = path.join(bridgeDir, "pending_delivery.json");
+  const turnStartedPath = path.join(bridgeDir, "turn_started.json");
+  const readPendingToken = (): string | undefined => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pendingDeliveryPath, "utf8"));
+      return parsed && typeof parsed.token === "string" ? parsed.token : undefined;
+    } catch { return undefined; }
+  };
+  const signalTurnStarted = (token: string | undefined): void => {
+    try {
+      const tmp = `${turnStartedPath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ token, at: Date.now() }));
+      fs.renameSync(tmp, turnStartedPath);
+    } catch { /* fail open */ }
+  };
   const request = async (url: string, method: string, body: unknown): Promise<boolean> => {
     try {
       const response = await fetch(url, { method, headers: { "content-type": "application/json", ...config.authHeaders }, body: JSON.stringify(body) });
@@ -57,9 +81,18 @@ export default function omnigentNative(amp: PluginAPI): void {
     await persistThreadID(id);
   });
   amp.on("agent.start", async (event: AmpEvent) => {
-    if (!managedThreadID || event.thread?.id !== managedThreadID) return;
+    // First turn can arrive before session.start attributes a managed thread
+    // (some Amp runtimes never emit it): adopt this thread on first contact
+    // rather than drop the turn-started signal; later turns reject others.
+    if (!event.thread?.id) return;
+    if (!managedThreadID) managedThreadID = event.thread.id;
+    else if (event.thread.id !== managedThreadID) return;
     const response_id = responseID(event);
     activeResponseID = response_id;
+    // Capture this delivery's token and stamp the marker BEFORE any awaited
+    // POST: the read+write run synchronously at event-fire time, so a slow
+    // prior handler can't read a newer token, and the signal is timely.
+    signalTurnStarted(readPendingToken());
     const text = event.message;
     if (typeof text === "string") await post({ type: "external_conversation_item", data: { item_type: "message", response_id, item_data: { role: "user", content: [{ type: "input_text", text }] } } });
     await post({ type: "external_session_status", data: { status: "running", response_id } });
