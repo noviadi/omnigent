@@ -94,7 +94,7 @@ def enqueue_interrupt(path: Path) -> str:
     return _enqueue(path, {"id": item_id, "type": "interrupt"})
 
 
-def inject_user_message(path: Path, content: str) -> None:
+def inject_user_message(path: Path, content: str) -> bool:
     """Paste a browser prompt into the resident Amp TUI.
 
     A blank Amp TUI has no thread yet, so its plugin cannot address the first
@@ -102,6 +102,13 @@ def inject_user_message(path: Path, content: str) -> None:
     thread naturally and also keeps every browser turn visible in the real TUI.
     The plugin observes the resulting ``agent.start`` and mirrors the user item
     back through Omnigent's pending-input reconciliation path.
+
+    Returns True when the submit was confirmed within the retry budget, or
+    False when it was not (non-fatal: the prompt was pasted and Enter pressed,
+    but the turn-started signal never arrived — e.g. Amp's first turn emits no
+    ``agent.start``). Raises ``RuntimeError`` only for delivery infra failures
+    (no tmux target advertised, the Amp terminal died, or a tmux command
+    errored) — those mean the prompt did not reach the TUI.
     """
     if not content:
         raise RuntimeError("amp-native injection requires non-empty content")
@@ -162,7 +169,7 @@ def inject_user_message(path: Path, content: str) -> None:
             "-t",
             tmux_target,
         )
-        _submit_and_verify(path, socket_path, tmux_target)
+        return _submit_and_verify(path, socket_path, tmux_target)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
@@ -240,7 +247,7 @@ def _wait_for_turn_started(path: Path, expected_token: str, *, timeout_s: float)
         time.sleep(_SUBMIT_POLL_INTERVAL_S)
 
 
-def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
+def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> bool:
     """Press ``Enter`` to submit the pasted prompt, verifying the turn started.
 
     Mirrors antigravity's bounded submit-verify loop, keyed on amp-native's
@@ -254,8 +261,12 @@ def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
     by :data:`_MAX_SUBMIT_ATTEMPTS`. The matching marker is re-checked
     immediately before every Enter, so an Enter whose signal lagged past the
     prior window never produces an Enter after this delivery's turn already
-    started. If the turn cannot be confirmed within the budget, raise rather
-    than lose the submit silently.
+    started. Returns True when the signal confirms this delivery within the
+    budget; returns False (non-fatal) when the budget is exhausted — the prompt
+    was pasted and Enter pressed up to :data:`_MAX_SUBMIT_ATTEMPTS` times, but
+    the resident plugin never signalled (e.g. Amp's first turn emits no
+    ``agent.start``). The caller surfaces an in-session warning rather than
+    failing the turn; see invariant #4.
     """
     token = uuid.uuid4().hex
     _write_pending_delivery(path, token)
@@ -267,15 +278,11 @@ def _submit_and_verify(path: Path, socket_path: str, tmux_target: str) -> None:
         # accepted parity-level residual (mirrors antigravity's check-then-act
         # residual; see AMP-NATIVE-0-2 non-goals).
         if _confirm_turn_started(path, token):
-            return
+            return True
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
         if _wait_for_turn_started(path, token, timeout_s=_SUBMIT_VERIFY_TIMEOUT_S):
-            return
-    raise RuntimeError(
-        "amp-native did not confirm the submitted turn started within the retry "
-        f"budget (<= {_MAX_SUBMIT_ATTEMPTS} Enter attempts); the prompt remains "
-        "unsubmitted — retry the turn or restart the session"
-    )
+            return True
+    return False
 
 
 def install_plugin_and_config(

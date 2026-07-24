@@ -15,6 +15,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    TextChunk,
     ToolSpec,
     TurnComplete,
 )
@@ -32,6 +33,18 @@ def _content_to_text(content: Any) -> str:
             and isinstance(block.get("text"), str)
         )
     return ""
+
+
+# Non-fatal warning surfaced in-session when the submit-confirm loop could not
+# verify the prompt reached Amp (invariant #4: budget-exhausted is non-fatal;
+# the session stays usable). Amp's first turn emits no agent.start, so the
+# turn-started signal never arrives for it — the prompt is still pasted and
+# Enter pressed; the user may just need to press Enter manually.
+_AMP_NATIVE_SUBMIT_UNCONFIRMED_WARNING = (
+    "Couldn't auto-confirm that Amp received the prompt on this first turn "
+    "(Amp emits no start signal for it). If it didn't send, press Enter in the "
+    "Amp terminal — the session stays usable for follow-ups."
+)
 
 
 class AmpNativeExecutor(Executor):
@@ -83,10 +96,16 @@ class AmpNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Amp native turn had no user text to send")
             return
+        confirmed = True
         try:
             async with self._send_lock:
-                await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
+                confirmed = await asyncio.to_thread(inject_user_message, self._bridge_dir, text)
         except RuntimeError as exc:
             yield ExecutorError(message=str(exc))
             return
+        # Submit-confirm exhaustion is non-fatal (invariant #4): the prompt was
+        # pasted and Enter pressed, but Amp's first turn emits no start signal to
+        # confirm against. Surface a heads-up rather than fail the turn.
+        if not confirmed:
+            yield TextChunk(text=_AMP_NATIVE_SUBMIT_UNCONFIRMED_WARNING)
         yield TurnComplete(response=None)

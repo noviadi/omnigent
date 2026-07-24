@@ -23,6 +23,7 @@ from omnigent.harness_aliases import (
 from omnigent.harness_plugins import AMP_NATIVE_CODING_AGENT, harness_capabilities
 from omnigent.inner import amp_native_executor as amp_native_executor_module
 from omnigent.inner.amp_native_executor import AmpNativeExecutor, _content_to_text
+from omnigent.inner.executor import ExecutorError, TextChunk, TurnComplete
 from omnigent.native_coding_agents import native_coding_agent_for_harness
 from omnigent.onboarding.harness_install import AMP_KEY, required_cli_for_harness
 
@@ -513,22 +514,68 @@ def test_submit_enter_attempts_bounded_on_persistent_failure(
     bridge = _bridge(tmp_path)
     fake = _wire_offline_submit(bridge, tmp_path, monkeypatch)  # never signals
 
-    with pytest.raises(RuntimeError):
-        amp_native_bridge.inject_user_message(bridge, "hello from browser")
+    confirmed = amp_native_bridge.inject_user_message(bridge, "hello from browser")
 
-    assert fake.enters == 3  # invariant 2: bounded, never an infinite loop
+    # Invariant #2 (bounded) + #4 (non-fatal): no exception, returns False so the
+    # caller can surface a warning instead of failing the turn.
+    assert confirmed is False
+    assert fake.enters == 3  # bounded, never an infinite loop
 
 
-def test_submit_budget_exhausted_raises_runtime_error(
+def _run_turn_events(executor: AmpNativeExecutor, text: str) -> list[object]:
+    async def collect() -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+                [],
+                "",
+            )
+        ]
+
+    return asyncio.run(collect())
+
+
+def test_run_turn_surfaces_warning_when_submit_unconfirmed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    bridge = _bridge(tmp_path)
-    fake = _wire_offline_submit(bridge, tmp_path, monkeypatch)  # never signals
+    # Amp's first turn emits no agent.start, so the resident plugin never stamps
+    # the turn-started marker and the submit-confirm loop exhausts non-fatally.
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    monkeypatch.setattr(
+        amp_native_executor_module, "inject_user_message", lambda _path, _content: False
+    )
+    executor = AmpNativeExecutor(bridge_dir=bridge)
 
-    with pytest.raises(RuntimeError, match="did not confirm the submitted turn"):
-        amp_native_bridge.inject_user_message(bridge, "hello from browser")
+    events = _run_turn_events(executor, "hello from browser")
 
-    assert fake.enters == 3  # invariant 4: loud failure, never silent
+    # Invariant #4 (amended): exhaustion is non-fatal — the turn completes, a
+    # user-visible warning is surfaced, and no ExecutorError fails the session.
+    assert isinstance(events[-1], TurnComplete)
+    assert not any(isinstance(event, ExecutorError) for event in events)
+    chunks = [event for event in events if isinstance(event, TextChunk)]
+    assert len(chunks) == 1
+    assert "Couldn't auto-confirm" in chunks[0].text
+    assert "press Enter" in chunks[0].text
+
+
+def test_run_turn_no_warning_when_submit_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    monkeypatch.setattr(
+        amp_native_executor_module, "inject_user_message", lambda _path, _content: True
+    )
+    executor = AmpNativeExecutor(bridge_dir=bridge)
+
+    events = _run_turn_events(executor, "hello from browser")
+
+    # A confirmed submit surfaces no warning and no error — just completion.
+    assert len(events) == 1
+    assert isinstance(events[0], TurnComplete)
+    assert not any(isinstance(event, (TextChunk, ExecutorError)) for event in events)
 
 
 def test_executor_serializes_concurrent_deliveries(
