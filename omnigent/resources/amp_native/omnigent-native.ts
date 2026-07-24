@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { PluginAPI, ThreadID } from "@ampcode/plugin";
 
-type Config = { sessionId: string; serverUrl: string; authHeaders: Record<string, string>; inboxDir: string };
+type Config = { sessionId: string; serverUrl: string; authHeaders: Record<string, string>; inboxDir: string; toolRelayPath?: string };
 type AmpEvent = { id?: string; thread?: { id?: ThreadID }; message?: string; status?: string; error?: unknown; messages?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }> };
+type RelayDescriptor = { url?: string; token?: string; tools?: Array<{ name?: string; description?: string; parameters?: Record<string, unknown> }> };
 
 export default function omnigentNative(amp: PluginAPI): void {
   const configPath = process.env.OMNIGENT_AMP_NATIVE_CONFIG;
@@ -56,6 +57,34 @@ export default function omnigentNative(amp: PluginAPI): void {
     }
   };
 
+  // Shared builtin-tool relay (started by the runner into the bridge dir).
+  // Each advertised schema becomes a registered Amp tool; execute POSTs
+  // {name, arguments} through the relay so policy/approval apply unchanged.
+  const readRelay = (): RelayDescriptor | null => {
+    if (!config.toolRelayPath) return null;
+    try { return JSON.parse(fs.readFileSync(config.toolRelayPath, "utf8")) as RelayDescriptor; } catch { return null; }
+  };
+  const callRelay = async (name: string, input: Record<string, unknown>): Promise<string> => {
+    const relay = readRelay();
+    if (!relay || typeof relay.url !== "string" || typeof relay.token !== "string") return "omnigent tool relay unavailable";
+    try {
+      const response = await fetch(`${relay.url.replace(/\/$/, "")}/tool`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${relay.token}` },
+        body: JSON.stringify({ name, arguments: input ?? {} }),
+      });
+      let body: { content?: Array<{ type?: string; text?: string }>; isError?: boolean } | null = null;
+      try { body = await response.json(); } catch { body = null; }
+      const text = Array.isArray(body?.content)
+        ? (body!.content.filter((b) => b.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n"))
+        : "";
+      if (!response.ok) return `relay error ${response.status}${text ? `: ${text}` : ""}`;
+      return text || (body ? JSON.stringify(body) : "ok");
+    } catch (error) {
+      return `relay call failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  };
+
   const drain = async (): Promise<void> => {
     try {
       for (const name of fs.readdirSync(config.inboxDir).filter((n) => n.endsWith(".json")).sort()) {
@@ -73,6 +102,24 @@ export default function omnigentNative(amp: PluginAPI): void {
     } catch { /* fail open */ }
   };
   setInterval(() => void drain(), 100).unref?.();
+
+  // Register the relay's tool schemas once at load (no hot-reload). The model
+  // can then select any of them; execute routes the call through the relay.
+  const relay = readRelay();
+  if (relay && Array.isArray(relay.tools)) {
+    for (const tool of relay.tools) {
+      if (!tool || typeof tool.name !== "string") continue;
+      const toolName = tool.name;
+      amp.registerTool({
+        name: toolName,
+        description: typeof tool.description === "string" ? tool.description : toolName,
+        inputSchema: (tool.parameters && typeof tool.parameters === "object"
+          ? { ...tool.parameters, type: "object" }
+          : { type: "object" }) as { type: "object"; properties?: Record<string, object>; required?: string[] },
+        execute: async (input: Record<string, unknown>) => callRelay(toolName, input ?? {}),
+      });
+    }
+  }
 
   amp.on("session.start", async (event: AmpEvent) => {
     const id = event.thread?.id;

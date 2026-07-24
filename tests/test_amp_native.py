@@ -614,6 +614,7 @@ def test_executor_serializes_concurrent_deliveries(
     # token channel). Without the per-executor send lock this would be 2.
     assert state["max_in_flight"] == 1
 
+
 # ── AMP-NATIVE-0-6: basic MCP relay (registerTool + shared relay) ──────────
 
 
@@ -877,9 +878,7 @@ def test_plugin_execute_relay_error_becomes_tool_result_not_throw(tmp_path: Path
             token=token,
             tools=_RELAY_TOOLS,
         )
-        result = _run_plugin_harness(
-            bridge, config, tool="sys_os_read", input_obj={"path": "/x"}
-        )
+        result = _run_plugin_harness(bridge, config, tool="sys_os_read", input_obj={"path": "/x"})
     finally:
         httpd.shutdown()
     assert result.returncode == 0, result.stderr
@@ -927,7 +926,14 @@ async def test_auto_create_amp_terminal_starts_relay_after_prepare_before_launch
 
         async def launch_required_terminal(self, **_kwargs: object) -> SimpleNamespace:
             events.append("launch")
-            return SimpleNamespace()
+            return SimpleNamespace(
+                id="res-1",
+                type="terminal",
+                session_id="conv_1",
+                name="amp",
+                metadata=None,
+                environment=None,
+            )
 
     import omnigent.amp_native as amp_native_mod
     import omnigent.cli_auth as cli_auth_mod

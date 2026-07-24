@@ -194,6 +194,7 @@ async def _auto_create_amp_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     agent_spec: AgentSpec | ResolvedSpec | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """Launch real interactive Amp with its process-scoped plugin config."""
     from omnigent.amp_native import build_amp_launch
@@ -226,6 +227,16 @@ async def _auto_create_amp_terminal(
         server_url=server_url,
         auth_headers=databricks_request_headers(server_url, bearer_token=token),
     )
+    # Start the shared builtin-tool relay BEFORE Amp launches so
+    # ``tool_relay.json`` exists where the plugin reads it on load. The relay
+    # POSTs each call back through the Omnigent server (policy enforced); the
+    # plugin registers those schemas via ``amp.registerTool``.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge,
+            await_notify=False,
+        )
     argv = build_amp_launch(
         launch_config.terminal_launch_args or [], external_session_id=external_id
     )
@@ -3221,6 +3232,7 @@ def create_runner_app(
                             _publish_event,
                             server_client=server_client,
                             agent_spec=_amp_spec,
+                            ensure_comment_relay=_ensure_comment_relay_started,
                         )
                     except Exception as exc:
                         _logger.exception(
@@ -7767,6 +7779,7 @@ def create_runner_app(
                         _publish_event,
                         server_client=server_client,
                         agent_spec=amp_agent_spec,
+                        ensure_comment_relay=_ensure_comment_relay_started,
                     )
                 except Exception as exc:
                     _logger.exception(
