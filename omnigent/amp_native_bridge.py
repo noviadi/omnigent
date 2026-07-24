@@ -43,6 +43,16 @@ _SUBMIT_POLL_INTERVAL_S = 0.1
 _TOOL_RELAY_FILE = "tool_relay.json"
 
 
+def bridge_root() -> Path:
+    """Return the configured Amp-native bridge root (``$HOME/.omnigent/amp-native``).
+
+    Same ``$HOME/.omnigent/<harness>-native`` shape codex/antigravity/opencode use;
+    the shared relay's secure-dir validator anchors on this so ``tool_relay.json``
+    can be written into a per-session subdir. Tests may monkeypatch :data:`_ROOT`.
+    """
+    return _ROOT
+
+
 def bridge_dir_for_session_id(session_id: str) -> Path:
     return _ROOT / hashlib.sha256(session_id.encode()).hexdigest()[:32]
 

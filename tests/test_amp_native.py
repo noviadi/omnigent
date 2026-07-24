@@ -963,3 +963,121 @@ async def test_auto_create_amp_terminal_starts_relay_after_prepare_before_launch
     prepare_at = events.index("prepare")
     launch_at = events.index("launch")
     assert prepare_at < relay_at < launch_at
+
+
+@pytest.mark.asyncio
+async def test_amp_session_init_writes_tool_relay_on_host_daemon_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AMP-NATIVE-0-6 invariant 1: the shared relay writes ``tool_relay.json``.
+
+    Drives the REAL runner ``_initialize_session`` over ASGI (the host-daemon
+    launch path) with a REAL httpx ``server_client`` — no mocked
+    ``ensure_comment_relay``. Regression for the silent skip where the shared
+    relay's secure-dir allowlist rejected the amp bridge root
+    (``$HOME/.omnigent/amp-native``), so ``start_tool_relay`` raised and
+    ``_ensure_comment_relay_started`` swallowed it: the amp terminal still
+    launched but Amp registered zero relayed tools.
+    """
+    import httpx
+
+    from omnigent.runner import create_runner_app
+    from omnigent.spec import load as load_spec
+    from omnigent.terminals import TerminalRegistry
+
+    # Redirect the amp bridge root into the test sandbox (production shape:
+    # <root>/.omnigent/amp-native/<hash>). ``_ROOT`` is computed at import time,
+    # so patch the module attribute, not HOME.
+    amp_root = tmp_path / ".omnigent" / "amp-native"
+    monkeypatch.setattr(amp_native_bridge, "_ROOT", amp_root)
+
+    session_id = "conv_amp_relay_001"
+    spec = load_spec(amp_native._materialize_amp_agent_spec(tmp_path))
+
+    async def spec_resolver(_agent_id: str, _sid: str) -> object:
+        return spec
+
+    snapshot = {
+        "session_id": session_id,
+        "workspace": str(tmp_path),
+        "terminal_launch_args": [],
+        "external_session_id": None,
+        "labels": {},
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.startswith("/v1/sessions/"):
+            return httpx.Response(200, json=snapshot)
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://omnigent-server",
+    )
+
+    class _FakeProcessManager:
+        handles_tool_dispatch = True
+
+        async def get_client(self, _conv: str, _harness: str, env: object = None) -> object:
+            return SimpleNamespace()
+
+    class _StubRegistry:
+        terminal_registry = None
+
+        def set_terminal_activity_publisher(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            def _stub(*_a: object, **_k: object) -> None:
+                return None
+
+            return _stub
+
+        async def launch_required_terminal(self, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                id="res-1",
+                type="terminal",
+                session_id=kwargs.get("session_id"),
+                name="amp",
+                metadata=None,
+                environment=None,
+            )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(),
+        spec_resolver=spec_resolver,
+        server_client=server_client,
+        resource_registry=_StubRegistry(),
+        terminal_registry=TerminalRegistry(),
+    )
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            resp = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": session_id,
+                    "agent_id": "amp-native-ui",
+                    "workspace": str(tmp_path),
+                },
+            )
+            assert resp.status_code == 201, f"session init failed: {resp.text}"
+    finally:
+        await server_client.aclose()
+
+    relay_file = amp_native_bridge.bridge_dir_for_session_id(session_id) / "tool_relay.json"
+    assert relay_file.exists(), (
+        "tool_relay.json was not written by the shared relay on the amp launch "
+        "path — Amp would register zero relayed tools"
+    )
+    info = json.loads(relay_file.read_text())
+    assert isinstance(info.get("tools"), list) and info["tools"], (
+        "tool_relay.json tools list is empty"
+    )
+    tool_names = {t["name"] for t in info["tools"]}
+    # Framework relay surface must reach the model: comment tools and at least
+    # one sys_os_* / sys_session_* tool from the shared builtin surface.
+    assert "list_comments" in tool_names or any(
+        n.startswith(("sys_os_", "sys_session_")) for n in tool_names
+    ), f"expected builtin relay tools, got {sorted(tool_names)[:8]}"
