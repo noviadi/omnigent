@@ -139,3 +139,23 @@ Each implementer reads `.polly/AGENT_SETUP.md` (tooling) and
   reported as `CONTRACT-GAP`, not a blocking code fix.
 
 See `.polly/AGENT_PROTOCOL.md` for the full text.
+
+---
+
+## 7. Implementation status
+
+| ID | Status | Notes |
+|---|---|---|
+| 0-Q | ✅ Done | Static audit (`.polly/0Q_static_audit.md`) + live `:6767` run. Confirmed 0-3/0-4/0-5 already work at runtime; 0-2 reproduced live. |
+| 0-2 | ✅ Done (shipped imperfect) | PR #3 merged into `feat/amp-native` (`89b0095b`). Verified bounded submit via nonce-correlated `turn_started.json` marker + per-executor `_send_lock`. First-turn auto-submit is imperfect: Amp emits **no** `agent.start` on turn 1 (only `session.start` + `agent.end`), so confirmation can't fire on the initial prompt → surfaced as a **non-fatal TextChunk warning** (not a hard error); session stays usable, follow-ups work. Real first-turn reliability (composer-scrape, mechanism B) deferred to Phase 1. Findings + decision in `.polly/0-2-live-debug.md`. |
+| 0-3 | ✅ Met (no work) | Transcript + lifecycle events confirmed working live. |
+| 0-4 | ✅ Met (no work) | Cancel via `thread.cancel()` confirmed live. |
+| 0-5 | ✅ Met (no work) | Resume via persisted `T-*` + `amp threads continue` confirmed. |
+| 0-6 | ✅ Done (pending merge) | PR #4 (`feat/amp-native-0-6`, rebased onto the 0-2-containing base, cross-reviewed PASS). Hybrid MCP relay: runner starts the shared relay (`ensure_comment_relay` after `prepare_bridge_dir`, before launch); bridge writes relay path into `config.json`; plugin registers each `tool_relay.json` schema via `amp.registerTool`; each tool `execute` POSTs through the shared relay with bearer auth. 23 tests pass. |
+
+**Phase 0 is code-complete pending the live verification of 0-6 and the merge of PR #4.**
+
+### Deferred to Phase 1 (tracked, not forgotten)
+
+- **0-2 first-turn reliability** — composer-scrape verification (mechanism B) so the initial prompt auto-submits without the warning. Parked findings in `.polly/0-2-live-debug.md`.
+- **AMP-NATIVE-001 durability work** — preserved at git tag `amp-native-001-parked` (tip `cd7a1eae`) as hardening reference; out of step with the platform's "no durable cursor" design, revisited on its own merits in Phase 1.
