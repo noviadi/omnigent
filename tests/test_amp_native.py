@@ -10,7 +10,9 @@ import stat
 import subprocess
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -611,3 +613,347 @@ def test_executor_serializes_concurrent_deliveries(
     # The two deliveries never ran concurrently (no interleaving on the TUI /
     # token channel). Without the per-executor send lock this would be 2.
     assert state["max_in_flight"] == 1
+
+# ── AMP-NATIVE-0-6: basic MCP relay (registerTool + shared relay) ──────────
+
+
+_RELAY_TOOLS = [
+    {
+        "name": "sys_os_read",
+        "description": "Read a file from the OS workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "manager_status",
+        "description": "Report the live runner status.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+]
+
+
+class _RelayRecorder:
+    """Captures the last relay POST the plugin made (auth + body)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last_auth: str | None = None
+        self.last_body: object | None = None
+
+
+def _start_relay(
+    token: str, *, status: int = 200, payload: object | None = None
+) -> tuple[ThreadingHTTPServer, int, _RelayRecorder]:
+    """Stand up the localhost shared-relay endpoint the plugin POSTs to."""
+    recorder = _RelayRecorder()
+    expected_auth = f"Bearer {token}"
+
+    def build_handler() -> type[BaseHTTPRequestHandler]:
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                del format, args
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                raw = self.rfile.read(length) if length else b""
+                try:
+                    body = json.loads(raw or b"{}")
+                except ValueError:
+                    body = None
+                with recorder.lock:
+                    recorder.last_auth = self.headers.get("Authorization")
+                    recorder.last_body = body
+                if self.headers.get("Authorization") != expected_auth:
+                    self._send(401, b"unauthorized")
+                    return
+                if status != 200:
+                    self._send(status, b"relay-failure")
+                    return
+                body_payload = payload
+                if body_payload is None:
+                    name = body.get("name") if isinstance(body, dict) else None
+                    body_payload = {
+                        "content": [
+                            {"type": "text", "text": json.dumps({"ok": True, "name": name})}
+                        ]
+                    }
+                self._send(200, json.dumps(body_payload).encode("utf-8"))
+
+            def _send(self, code: int, data: bytes) -> None:
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        return _Handler
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), build_handler())
+    thread = threading.Thread(target=httpd.serve_forever, name="relay-stub", daemon=True)
+    thread.start()
+    return httpd, httpd.server_address[1], recorder
+
+
+_PLUGIN_HARNESS_TEMPLATE = """\
+import plugin from "file://__PLUGIN__";
+const registrations = [];
+const amp = {
+  on: () => {},
+  threads: { get: async () => ({ cancel: async () => {} }) },
+  registerTool: (def) => { registrations.push(def); return { unsubscribe: () => {} }; },
+};
+plugin(amp);
+const summary = registrations.map((r) => ({
+  name: r.name,
+  description: r.description,
+  inputSchemaType: r.inputSchema && r.inputSchema.type,
+  required: r.inputSchema && r.inputSchema.required,
+}));
+console.log("REGISTERED=" + JSON.stringify(summary));
+const target = registrations.find((r) => r.name === "__TOOL__") || registrations[0];
+if (target) {
+  try {
+    const res = await target.execute(__INPUT__);
+    console.log("RESULT=" + JSON.stringify(res));
+    console.log("TYPE=" + typeof res);
+  } catch (e) {
+    console.log("THREW=" + String((e && e.message) ? e.message : e));
+  }
+}
+process.exit(0);
+"""
+
+
+def _write_relay_config(
+    bridge: Path, *, server_url: str, token: str, tools: list[dict[str, object]]
+) -> tuple[Path, Path]:
+    """Write the per-session config.json + tool_relay.json the plugin reads."""
+    relay_path = bridge / "tool_relay.json"
+    relay_path.write_text(
+        json.dumps(
+            {
+                "url": server_url,
+                "token": token,
+                "tools": tools,
+                "pid": 1,
+                "updated_at": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = bridge / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "sessionId": "s",
+                "serverUrl": "http://127.0.0.1:1",
+                "authHeaders": {},
+                "inboxDir": str(bridge / "inbox"),
+                "toolRelayPath": str(relay_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config, relay_path
+
+
+def _run_plugin_harness(
+    bridge: Path, config: Path, *, tool: str, input_obj: dict[str, object]
+) -> subprocess.CompletedProcess[str]:
+    plugin_src = (
+        Path(amp_native_bridge.__file__).parent / "resources" / "amp_native" / "omnigent-native.ts"
+    )
+    harness = bridge / "harness.mjs"
+    harness.write_text(
+        _PLUGIN_HARNESS_TEMPLATE.replace("__PLUGIN__", str(plugin_src))
+        .replace("__TOOL__", tool)
+        .replace("__INPUT__", json.dumps(input_obj)),
+        encoding="utf-8",
+    )
+    env = {**os.environ, "OMNIGENT_AMP_NATIVE_CONFIG": str(config)}
+    return subprocess.run(
+        ["node", str(harness)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def _harness_line(out: str, prefix: str) -> str:
+    return next(line for line in out.splitlines() if line.startswith(prefix)).split("=", 1)[1]
+
+
+def test_config_json_includes_relay_path_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """config.json carries toolRelayPath alongside the existing fields."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    bridge = tmp_path / "bridge"
+    _target, config = amp_native_bridge.install_plugin_and_config(
+        bridge, session_id="conv_1", server_url="http://server/", auth_headers={"x": "y"}
+    )
+    payload = json.loads(config.read_text())
+    # Existing fields preserved.
+    assert payload["sessionId"] == "conv_1"
+    assert payload["serverUrl"] == "http://server"
+    assert payload["authHeaders"] == {"x": "y"}
+    assert payload["inboxDir"] == str(bridge / "inbox")
+    # New relay-path field points at the session bridge dir's descriptor.
+    assert payload["toolRelayPath"] == str(bridge / "tool_relay.json")
+
+
+def test_plugin_registers_each_relay_tool_schema(tmp_path: Path) -> None:
+    """Every tool_relay.json schema is registered via amp.registerTool."""
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    config, _relay = _write_relay_config(
+        bridge,
+        server_url="http://127.0.0.1:1",  # unreachable; registration needs no call
+        token="irrelevant",
+        tools=_RELAY_TOOLS,
+    )
+    result = _run_plugin_harness(bridge, config, tool="sys_os_read", input_obj={"path": "/x"})
+    assert result.returncode == 0, result.stderr
+    registered = json.loads(_harness_line(result.stdout, "REGISTERED="))
+    assert [t["name"] for t in registered] == ["sys_os_read", "manager_status"]
+    by_name = {t["name"]: t for t in registered}
+    assert by_name["sys_os_read"]["description"] == _RELAY_TOOLS[0]["description"]
+    assert by_name["sys_os_read"]["inputSchemaType"] == "object"
+    assert by_name["sys_os_read"]["required"] == ["path"]
+    assert by_name["manager_status"]["description"] == _RELAY_TOOLS[1]["description"]
+
+
+def test_plugin_execute_routes_through_relay_with_bearer(tmp_path: Path) -> None:
+    """A registered tool's execute POSTs {name, arguments} to the shared relay
+    url with the bearer token and returns a PluginToolResult from the response."""
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    token = "relay-bearer-token"
+    httpd, port, recorder = _start_relay(token)
+    try:
+        config, _relay = _write_relay_config(
+            bridge,
+            server_url=f"http://127.0.0.1:{port}",
+            token=token,
+            tools=_RELAY_TOOLS,
+        )
+        result = _run_plugin_harness(
+            bridge, config, tool="sys_os_read", input_obj={"path": "/etc/hosts"}
+        )
+    finally:
+        httpd.shutdown()
+    assert result.returncode == 0, result.stderr
+    assert "THREW=" not in result.stdout
+    # POST routed to the shared relay with the bearer token + arguments body.
+    with recorder.lock:
+        assert recorder.last_auth == f"Bearer {token}"
+        assert recorder.last_body == {"name": "sys_os_read", "arguments": {"path": "/etc/hosts"}}
+    # Result is a PluginToolResult string carrying the relay's content text.
+    value = json.loads(_harness_line(result.stdout, "RESULT="))
+    assert _harness_line(result.stdout, "TYPE=") == "string"
+    assert json.loads(value)["ok"] is True
+
+
+def test_plugin_execute_relay_error_becomes_tool_result_not_throw(tmp_path: Path) -> None:
+    """A relay error (non-ok) becomes a tool result, not an uncaught throw."""
+    if shutil.which("node") is None:
+        pytest.skip("node is not installed")
+    bridge = tmp_path / "bridge"
+    (bridge / "inbox").mkdir(parents=True)
+    token = "relay-bearer-token"
+    httpd, port, _recorder = _start_relay(token, status=500)
+    try:
+        config, _relay = _write_relay_config(
+            bridge,
+            server_url=f"http://127.0.0.1:{port}",
+            token=token,
+            tools=_RELAY_TOOLS,
+        )
+        result = _run_plugin_harness(
+            bridge, config, tool="sys_os_read", input_obj={"path": "/x"}
+        )
+    finally:
+        httpd.shutdown()
+    assert result.returncode == 0, result.stderr
+    assert "THREW=" not in result.stdout
+    value = json.loads(_harness_line(result.stdout, "RESULT="))
+    assert isinstance(value, str) and value
+
+
+@pytest.mark.asyncio
+async def test_auto_create_amp_terminal_starts_relay_after_prepare_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ensure_comment_relay fires after prepare_bridge_dir and before launch."""
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _auto_create_amp_terminal
+
+    events: list[str] = []
+
+    def fake_prepare(session_id: str) -> Path:
+        events.append("prepare")
+        bridge = tmp_path / "bridge"
+        (bridge / "inbox").mkdir(parents=True, exist_ok=True)
+        return bridge
+
+    def fake_install(bridge: Path, **_kwargs: object) -> tuple[Path, Path]:
+        events.append("config")
+        return bridge / "plugin.ts", bridge / "config.json"
+
+    def fake_clear(_path: Path) -> None:
+        events.append("clear")
+
+    async def fake_launch_config(*, session_id: str, server_client: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            server_url="http://server",
+            external_session_id=None,
+            terminal_launch_args=[],
+            workspace=str(tmp_path),
+        )
+
+    async def ensure_relay(session_id: str, **_kwargs: object) -> None:
+        events.append("relay")
+
+    class _FakeRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **_kwargs: object) -> SimpleNamespace:
+            events.append("launch")
+            return SimpleNamespace()
+
+    import omnigent.amp_native as amp_native_mod
+    import omnigent.cli_auth as cli_auth_mod
+    import omnigent.runner._entry as runner_entry
+
+    monkeypatch.setattr(amp_native_bridge, "prepare_bridge_dir", fake_prepare)
+    monkeypatch.setattr(amp_native_bridge, "clear_inbox", fake_clear)
+    monkeypatch.setattr(amp_native_bridge, "install_plugin_and_config", fake_install)
+    # Module-level imports in app.py — patchable on the app namespace.
+    monkeypatch.setattr(runner_app, "_pi_native_launch_config", fake_launch_config)
+    monkeypatch.setattr(runner_app, "_agent_os_env_from_spec", lambda _spec: None)
+    # Locally-imported helpers inside _auto_create_amp_terminal — patch source.
+    monkeypatch.setattr(runner_entry, "_make_auth_token_factory", lambda: lambda: "tok")
+    monkeypatch.setattr(amp_native_mod, "build_amp_launch", lambda *a, **k: ["amp"])
+    monkeypatch.setattr(cli_auth_mod, "databricks_request_headers", lambda *a, **k: {})
+
+    await _auto_create_amp_terminal(
+        "conv_1",
+        _FakeRegistry(),  # type: ignore[arg-type]
+        lambda *_a, **_k: None,
+        server_client=object(),  # truthy so the relay guard fires
+        agent_spec=None,
+        ensure_comment_relay=ensure_relay,  # type: ignore[call-arg]
+    )
+
+    relay_at = events.index("relay")
+    prepare_at = events.index("prepare")
+    launch_at = events.index("launch")
+    assert prepare_at < relay_at < launch_at
