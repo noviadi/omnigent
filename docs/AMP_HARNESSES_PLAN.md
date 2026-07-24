@@ -151,9 +151,9 @@ See `.polly/AGENT_PROTOCOL.md` for the full text.
 | 0-3 | ✅ Met (no work) | Transcript + lifecycle events confirmed working live. |
 | 0-4 | ✅ Met (no work) | Cancel via `thread.cancel()` confirmed live. |
 | 0-5 | ✅ Met (no work) | Resume via persisted `T-*` + `amp threads continue` confirmed. |
-| 0-6 | ✅ Done (pending merge) | PR #4 (`feat/amp-native-0-6`, rebased onto the 0-2-containing base, cross-reviewed PASS). Hybrid MCP relay: runner starts the shared relay (`ensure_comment_relay` after `prepare_bridge_dir`, before launch); bridge writes relay path into `config.json`; plugin registers each `tool_relay.json` schema via `amp.registerTool`; each tool `execute` POSTs through the shared relay with bearer auth. 23 tests pass. |
+| 0-6 | ✅ Done | PR #4 merged into `feat/amp-native`. Hybrid MCP relay: runner starts the shared relay (`ensure_comment_relay` after `prepare_bridge_dir`, before launch); bridge writes relay path into `config.json`; plugin registers each `tool_relay.json` schema via `amp.registerTool`; each tool `execute` POSTs through the shared relay with bearer auth. Required fix `0dfbf819`: the `amp-native` branch was missing from the shared relay's secure-dir allowlist, so `tool_relay.json` was never written live — now added with a real runner-path regression test. **Live-verified:** Amp sees the relayed `sys_*` / comment tools and a `sys_os_shell` call round-trips through Omnigent. 24 tests pass. |
 
-**Phase 0 is code-complete pending the live verification of 0-6 and the merge of PR #4.**
+**Phase 0 is complete: `amp-native` is a working, imperfect peer of the other native agents.** First-turn submit reliability and durability are tracked below for Phase 1.
 
 ### Deferred to Phase 1 (tracked, not forgotten)
 

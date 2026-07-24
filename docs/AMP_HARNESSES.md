@@ -30,9 +30,12 @@ This is deliberately a native TUI integration rather than an ACP adapter:
 - Omnigent owns process lifecycle, tmux attachment, browser input delivery,
   transcript mirroring, status, interrupt, and cold resume.
 
-The MVP is suitable for local/manual evaluation. MCP relay integration,
-structured tool-call mirroring, token-level streaming, and exactly-once event
-delivery are documented follow-ups rather than implied capabilities.
+The MVP is suitable for local/manual evaluation. Omnigent's builtin tool
+surface is now relayed into Amp via `amp.registerTool` (verified end-to-end:
+Amp sees the `sys_*` / comment tools and a `sys_os_shell` call round-trips
+through Omnigent). Structured tool-call mirroring, token-level streaming, and
+exactly-once event delivery remain documented follow-ups rather than implied
+capabilities.
 
 A second, non-interactive Amp surface is planned. It will run Amp's supported
 `--execute --stream-json` interface directly as an Omnigent harness. It will
@@ -68,7 +71,6 @@ implementation of the direct harness.
 - Token-by-token assistant or thinking mirroring. Amp's current plugin API has
   no message-delta events.
 - Mirroring structured tool calls/results into browser chat.
-- Routing Omnigent's native MCP relay into Amp.
 - Browser-driven model switching or compaction.
 - Reconstructing Amp thread history for cross-harness forks.
 - Exactly-once delivery across an Omnigent server outage.
@@ -407,13 +409,21 @@ idempotency-key contract. Retrying after an ambiguous network failure could
 duplicate history, while not retrying can lose an event. The MVP therefore
 keeps transcript/status posts best-effort and retries only the idempotent Amp
 thread-ID patch. Exactly-once behavior requires a server-side idempotency
-contract before a durable plugin outbox is safe.
+contract before a durable plugin outbox is safe. (This matches the platform's
+stated design — `pi-native` drops stale payloads on restart and
+`antigravity-native` carries an explicit "no durable read cursor" comment; the
+shared server POST path deliberately avoids dedupe.)
 
-### No Omnigent MCP relay yet
+### First-turn prompt submission
 
-Amp can accept `--mcp-config`, but this branch does not yet generate and pass a
-session-local Omnigent relay configuration. Amp runs with its native built-in
-and user-configured tools.
+In this Amp runtime, `agent.start` does not fire for the *first* turn of a
+fresh session (only `session.start` and `agent.end`), so the verified-submit
+check cannot confirm the initial prompt. The runner re-sends `Enter` up to a
+bounded budget (≤3) and, on exhaustion, surfaces a **non-fatal warning**
+(prompt to press Enter in the Amp terminal) rather than a hard error. The
+session stays usable; follow-up turns deliver normally. Reliable first-turn
+auto-submit (composer-scrape verification) is tracked as Phase 1 hardening in
+[`AMP_HARNESSES_PLAN.md`](AMP_HARNESSES_PLAN.md).
 
 ### No structured tool visualization or policy bridge
 
@@ -834,13 +844,19 @@ The direct harness is ready for initial release when:
 
 ## Interactive `amp-native` follow-up plan
 
-The prioritized reliability work, with per-task definitions of done, is tracked
-in [`AMP_HARNESSES_TASK.md`](AMP_HARNESSES_TASK.md). The roadmap below covers
-broader qualification, refactoring, and feature-parity work.
+The Phase 0 qualification and the work that followed it are recorded in
+[`AMP_HARNESSES_PLAN.md`](AMP_HARNESSES_PLAN.md) §7; the older durability-heavy
+list in [`AMP_HARNESSES_TASK.md`](AMP_HARNESSES_TASK.md) is superseded and kept
+for history. The roadmap below covers broader qualification, refactoring, and
+feature-parity work.
 
-### Priority 1: manual end-to-end qualification
+### Priority 1: manual end-to-end qualification — DONE (Phase 0)
 
-Run the following against a local Omnigent server and authenticated Amp:
+The matrix below was driven against a local Omnigent server with authenticated
+Amp (the `0-Q` qualification). Results: launch, transcript/status, cancel, and
+resume all passed live; the only real parity gaps found were bounded
+prompt-submit reliability (0-2, shipped imperfect — see *Current limitations*)
+and MCP relay (0-6, shipped). The original checklist, retained for re-runs:
 
 1. `omnigent amp` opens the actual Amp TUI.
 2. A browser prompt appears once in Amp and once in durable browser history.
@@ -858,11 +874,16 @@ wrapper modules. Parameterize it with native-agent metadata, terminal name,
 launch arguments, progress labels, and resume picker identity. Migrate Pi and
 Amp to the helper without changing behavior.
 
-### Priority 3: Omnigent MCP relay
+### Priority 3: Omnigent MCP relay — DONE (Phase 0, task 0-6)
 
-Generate a per-session MCP configuration in the bridge directory, pass it via
-Amp's `--mcp-config`, and start the existing native comment/tool relay. Verify
-that concurrent sessions do not share relay credentials or tool state.
+Implemented as a hybrid: the runner starts the existing shared native tool
+relay, the bridge writes the relay path into the session `config.json`, and the
+Amp plugin registers each relayed tool schema via `amp.registerTool`, with each
+tool's `execute` POSTing through the shared relay using its per-descriptor
+bearer token. Verified end-to-end live: Amp sees the relayed `sys_*` /
+`comment` tools and a `sys_os_shell` call round-trips through Omnigent.
+Per-session credentials and tool state are isolated by the per-session bridge
+directory.
 
 ### Priority 4: tool and permission mirroring
 
