@@ -29,8 +29,8 @@ _TMUX_BUFFER = "omnigent_amp_native_paste"
 # stale marker or a delayed previous-turn write cannot false-confirm.
 _TURN_STARTED_FILE = "turn_started.json"
 # Bridge -> plugin channel for the current delivery's token. The plugin reads
-# this at ``agent.start`` and stamps the marker with it (mirrors the interrupt
-# inbox's file-IPC; no new plugin event type, no config field).
+# this at ``agent.start`` and stamps the marker with it (mirrors the
+# interrupt inbox's file-IPC; no new plugin event type, no config field).
 _PENDING_DELIVERY_FILE = "pending_delivery.json"
 _MAX_SUBMIT_ATTEMPTS = 3
 # How long one submit Enter is given for the resident plugin to signal that the
@@ -38,6 +38,9 @@ _MAX_SUBMIT_ATTEMPTS = 3
 # latency is not a correctness concern.
 _SUBMIT_VERIFY_TIMEOUT_S = 5.0
 _SUBMIT_POLL_INTERVAL_S = 0.1
+# Per-tool relay manifest the runner writes alongside the inbox; the plugin
+# registers each schema via amp.registerTool and POSTs executions through it.
+_TOOL_RELAY_FILE = "tool_relay.json"
 
 
 def bridge_dir_for_session_id(session_id: str) -> Path:
@@ -298,6 +301,9 @@ def install_plugin_and_config(
             "serverUrl": server_url.rstrip("/"),
             "authHeaders": auth_headers,
             "inboxDir": str(path / "inbox"),
+            # Where the runner's shared builtin-tool relay writes
+            # ``tool_relay.json``; the plugin reads it to register relay tools.
+            "toolRelayPath": str(path / _TOOL_RELAY_FILE),
         }
     )
     fd, temporary_config = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=path)
