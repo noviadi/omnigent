@@ -225,6 +225,12 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
     ``omnigent run --harness hermes-native``, AND it wraps the ``hermes`` CLI
     binary. Its coverage is the dedicated hermes-native bridge/executor/forwarder/
     approval-mirror unit tests.
+
+    ``amp-native`` is excluded for the same reason as ``antigravity-native`` /
+    ``goose-native`` / ``hermes-native``: it is a terminal-first TUI launched via
+    ``omnigent amp`` (runner-owned Amp tmux pane + bridge dir), not
+    ``omnigent run --harness amp-native``. Its coverage is the dedicated
+    amp-native bridge/executor/plugin unit tests.
     """
     expected_live_harnesses = set(OMNIGENT_HARNESSES).intersection(_HARNESS_MODULES) - {
         "acp",
@@ -236,6 +242,7 @@ def test_run_harness_live_matrix_covers_registered_coding_harnesses() -> None:
         "cursor-native",
         "antigravity",
         "antigravity-native",
+        "amp-native",
         "copilot",
         "qwen",
         "qwen-native",
