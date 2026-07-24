@@ -51,6 +51,10 @@ from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY,
 # first-run ``run`` flow falls back to it, so it has install metadata too.
 PI_KEY = "pi"
 
+# Amp authenticates through its own login flow and is installed by its shell
+# installer rather than npm. The native harness only gates on binary presence.
+AMP_KEY = "amp"
+
 # Qwen Code uses npm installation and has login/logout commands similar to
 # other coding CLIs. The binary name is ``qwen``.
 QWEN_KEY = "qwen"
@@ -119,6 +123,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         status_args=("login", "status"),
     ),
     PI_KEY: HarnessInstallSpec("Pi", "pi", "@earendil-works/pi-coding-agent"),
+    AMP_KEY: HarnessInstallSpec(
+        "Amp",
+        "amp",
+        package=None,
+        install_hint="curl -fsSL https://ampcode.com/install.sh | bash",
+    ),
     # Pin the install to the supported 1.17.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a
     # version the runtime version-check (``check_opencode_version``,
@@ -222,6 +232,7 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
 # harness (which drives the ``cursor-sdk`` Python package over its own bundled
 # bridge, NOT the ``cursor-agent`` CLI).
 _HARNESS_NAME_TO_KEY: dict[str, str] = {
+    "amp-native": AMP_KEY,
     "claude-native": ANTHROPIC_FAMILY,
     "codex-native": OPENAI_FAMILY,
     PI_KEY: PI_KEY,

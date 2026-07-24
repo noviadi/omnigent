@@ -37,6 +37,7 @@ from omnigent.harness_availability import (
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.onboarding.harness_install import (
+    AMP_KEY,
     COPILOT_KEY,
     CURSOR_KEY,
     GOOSE_KEY,
@@ -92,6 +93,9 @@ _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
 # ``_HARNESS_FAMILY`` entry — pi uses the ``PI_SURFACE`` sentinel — so they must
 # be gated explicitly or they fail open like an unknown harness.
 _PI_HARNESSES: frozenset[str] = frozenset({PI_SURFACE, "pi-native"})
+
+# Native Amp wraps the interactive ``amp`` CLI and owns its authentication.
+_AMP_NATIVE_HARNESSES: frozenset[str] = frozenset({"amp-native"})
 
 # Surface name for Kimi Code in the readiness map. Mirrors :data:`PI_SURFACE`
 # — kimi is a CLI-backed harness with its own backend (Moonshot AI's), not a
@@ -177,6 +181,8 @@ def _install_key(canonical: str) -> str:
         return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
         return QWEN_KEY
+    if canonical in _AMP_NATIVE_HARNESSES:
+        return AMP_KEY
     return _HARNESS_FAMILY.get(canonical) or PI_KEY
 
 
@@ -270,6 +276,7 @@ def harness_is_configured(harness: str) -> bool:
     if (
         canonical not in _HARNESS_FAMILY
         and canonical not in _PI_HARNESSES
+        and canonical not in _AMP_NATIVE_HARNESSES
         and canonical != KIMI_SURFACE
         and canonical not in _KIMI_NATIVE_HARNESSES
         and canonical not in _OPENCODE_HARNESSES

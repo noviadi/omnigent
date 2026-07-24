@@ -34,6 +34,8 @@ from omnigent.harness_plugins import harness_modules
 # suite injects fixture entries at test time (via direct dict
 # mutation in conftest fixtures).
 _HARNESS_MODULES: dict[str, str] = {
+    "amp-native": "omnigent.inner.amp_native_harness",
+    "native-amp": "omnigent.inner.amp_native_harness",
     # Step 4b: claude-sdk harness wrap. See
     # omnigent/inner/claude_sdk_harness.py.
     "claude-sdk": "omnigent.inner.claude_sdk_harness",

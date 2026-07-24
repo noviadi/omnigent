@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent._wrapper_labels import (
+    AMP_NATIVE_WRAPPER_VALUE,
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
@@ -125,6 +126,15 @@ PI_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="pi",
 )
 
+AMP_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="amp",
+    display_name="Amp",
+    agent_name="amp-native-ui",
+    harness="amp-native",
+    wrapper_label=AMP_NATIVE_WRAPPER_VALUE,
+    terminal_name="amp",
+)
+
 OPENCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
     key="opencode",
     display_name="OpenCode",
@@ -216,6 +226,19 @@ _AU = AuthModel
 # bench today; the rest are declared best-effort by integration mode and will be
 # reconciled against the bench's interrupt/streaming probes as coverage expands.
 _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
+    "amp-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.NONE,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=False,
+        steering=True,
+        live_queue=True,
+    ),
     # Native-CLI harnesses (wrap a resident vendor TUI/server).
     "claude-native": _C(
         _IM.NATIVE_TUI,
@@ -509,6 +532,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     name="omnigent",
     valid_harnesses=frozenset(
         {
+            "amp-native",
             "acp",
             "antigravity",
             "antigravity-native",
@@ -536,6 +560,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         }
     ),
     harness_modules={
+        "amp-native": "omnigent.inner.amp_native_harness",
         "acp": "omnigent.inner.acp_harness",
         "antigravity": "omnigent.inner.antigravity_harness",
         "antigravity-native": "omnigent.inner.antigravity_native_harness",
@@ -561,6 +586,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "qwen-native": "omnigent.inner.qwen_native_harness",
     },
     aliases={
+        "native-amp": "amp-native",
         "agy": "antigravity",
         "claude": "claude-sdk",
         "github-copilot": "copilot",
@@ -580,6 +606,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
     },
     native_harnesses=frozenset(
         {
+            "amp-native",
+            "native-amp",
             "antigravity-native",
             "claude-native",
             "codex-native",
@@ -605,6 +633,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         }
     ),
     native_agents=(
+        AMP_NATIVE_CODING_AGENT,
         CLAUDE_NATIVE_CODING_AGENT,
         CODEX_NATIVE_CODING_AGENT,
         PI_NATIVE_CODING_AGENT,

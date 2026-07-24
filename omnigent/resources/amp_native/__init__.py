@@ -1,0 +1,1 @@
+"""Packaged Amp native plugin."""

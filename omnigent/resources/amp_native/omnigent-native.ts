@@ -1,0 +1,156 @@
+// omnigent-managed-amp-native-plugin
+import fs from "node:fs";
+import path from "node:path";
+import type { PluginAPI, ThreadID } from "@ampcode/plugin";
+
+type Config = { sessionId: string; serverUrl: string; authHeaders: Record<string, string>; inboxDir: string; toolRelayPath?: string };
+type AmpEvent = { id?: string; thread?: { id?: ThreadID }; message?: string; status?: string; error?: unknown; messages?: Array<{ role?: string; content?: Array<{ type?: string; text?: string }> }> };
+type RelayDescriptor = { url?: string; token?: string; tools?: Array<{ name?: string; description?: string; parameters?: Record<string, unknown> }> };
+
+export default function omnigentNative(amp: PluginAPI): void {
+  const configPath = process.env.OMNIGENT_AMP_NATIVE_CONFIG;
+  if (!configPath || !fs.existsSync(configPath)) return;
+  let config: Config;
+  try { config = JSON.parse(fs.readFileSync(configPath, "utf8")); } catch { return; }
+  if (!config || typeof config.sessionId !== "string" || typeof config.serverUrl !== "string" ||
+      typeof config.inboxDir !== "string" || !config.authHeaders || typeof config.authHeaders !== "object") return;
+
+  let managedThreadID: ThreadID | undefined;
+  let activeResponseID: string | undefined;
+  const responseID = (event: AmpEvent): string => `${String(managedThreadID)}:${event.id ?? "event"}`;
+  // Local turn-started marker for the delivery path's submit-verify loop. The
+  // bridge dir is the parent of the inbox dir it already polls, so no new config
+  // field is needed. The marker is correlated to a specific delivery by a nonce
+  // the bridge publishes (pending_delivery.json) so a stale marker or a delayed
+  // previous-turn write cannot false-confirm. The token is captured and the
+  // marker written BEFORE any awaited POST, so a slow prior handler can't adopt
+  // a newer token and the signal is timely. Mirrors the interrupt inbox's
+  // file-IPC; not a new plugin event type.
+  const bridgeDir = path.dirname(config.inboxDir);
+  const pendingDeliveryPath = path.join(bridgeDir, "pending_delivery.json");
+  const turnStartedPath = path.join(bridgeDir, "turn_started.json");
+  const readPendingToken = (): string | undefined => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pendingDeliveryPath, "utf8"));
+      return parsed && typeof parsed.token === "string" ? parsed.token : undefined;
+    } catch { return undefined; }
+  };
+  const signalTurnStarted = (token: string | undefined): void => {
+    try {
+      const tmp = `${turnStartedPath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ token, at: Date.now() }));
+      fs.renameSync(tmp, turnStartedPath);
+    } catch { /* fail open */ }
+  };
+  const request = async (url: string, method: string, body: unknown): Promise<boolean> => {
+    try {
+      const response = await fetch(url, { method, headers: { "content-type": "application/json", ...config.authHeaders }, body: JSON.stringify(body) });
+      return response.ok;
+    } catch { return false; }
+  };
+  const post = (body: unknown) => request(`${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`, "POST", body);
+  const persistThreadID = async (id: ThreadID): Promise<void> => {
+    const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}`;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (await request(url, "PATCH", { external_session_id: id })) return;
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  };
+
+  // Shared builtin-tool relay (started by the runner into the bridge dir).
+  // Each advertised schema becomes a registered Amp tool; execute POSTs
+  // {name, arguments} through the relay so policy/approval apply unchanged.
+  const readRelay = (): RelayDescriptor | null => {
+    if (!config.toolRelayPath) return null;
+    try { return JSON.parse(fs.readFileSync(config.toolRelayPath, "utf8")) as RelayDescriptor; } catch { return null; }
+  };
+  const callRelay = async (name: string, input: Record<string, unknown>): Promise<string> => {
+    const relay = readRelay();
+    if (!relay || typeof relay.url !== "string" || typeof relay.token !== "string") return "omnigent tool relay unavailable";
+    try {
+      const response = await fetch(`${relay.url.replace(/\/$/, "")}/tool`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${relay.token}` },
+        body: JSON.stringify({ name, arguments: input ?? {} }),
+      });
+      let body: { content?: Array<{ type?: string; text?: string }>; isError?: boolean } | null = null;
+      try { body = await response.json(); } catch { body = null; }
+      const text = Array.isArray(body?.content)
+        ? (body!.content.filter((b) => b.type === "text" && typeof b.text === "string").map((b) => b.text as string).join("\n"))
+        : "";
+      if (!response.ok) return `relay error ${response.status}${text ? `: ${text}` : ""}`;
+      return text || (body ? JSON.stringify(body) : "ok");
+    } catch (error) {
+      return `relay call failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  };
+
+  const drain = async (): Promise<void> => {
+    try {
+      for (const name of fs.readdirSync(config.inboxDir).filter((n) => n.endsWith(".json")).sort()) {
+        const file = path.join(config.inboxDir, name);
+        let item: { id?: string; type?: string; content?: string };
+        try { item = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+        if (!managedThreadID) continue;
+        try {
+          const thread = await amp.threads.get(managedThreadID);
+          if (item.type === "interrupt") await thread.cancel();
+          else continue;
+          fs.unlinkSync(file);
+        } catch { /* retain for retry */ }
+      }
+    } catch { /* fail open */ }
+  };
+  setInterval(() => void drain(), 100).unref?.();
+
+  // Register the relay's tool schemas once at load (no hot-reload). The model
+  // can then select any of them; execute routes the call through the relay.
+  const relay = readRelay();
+  if (relay && Array.isArray(relay.tools)) {
+    for (const tool of relay.tools) {
+      if (!tool || typeof tool.name !== "string") continue;
+      const toolName = tool.name;
+      amp.registerTool({
+        name: toolName,
+        description: typeof tool.description === "string" ? tool.description : toolName,
+        inputSchema: (tool.parameters && typeof tool.parameters === "object"
+          ? { ...tool.parameters, type: "object" }
+          : { type: "object" }) as { type: "object"; properties?: Record<string, object>; required?: string[] },
+        execute: async (input: Record<string, unknown>) => callRelay(toolName, input ?? {}),
+      });
+    }
+  }
+
+  amp.on("session.start", async (event: AmpEvent) => {
+    const id = event.thread?.id;
+    if (!id || (managedThreadID && managedThreadID !== id)) return;
+    managedThreadID = id;
+    await persistThreadID(id);
+  });
+  amp.on("agent.start", async (event: AmpEvent) => {
+    // First turn can arrive before session.start attributes a managed thread
+    // (some Amp runtimes never emit it): adopt this thread on first contact
+    // rather than drop the turn-started signal; later turns reject others.
+    if (!event.thread?.id) return;
+    if (!managedThreadID) managedThreadID = event.thread.id;
+    else if (event.thread.id !== managedThreadID) return;
+    const response_id = responseID(event);
+    activeResponseID = response_id;
+    // Capture this delivery's token and stamp the marker BEFORE any awaited
+    // POST: the read+write run synchronously at event-fire time, so a slow
+    // prior handler can't read a newer token, and the signal is timely.
+    signalTurnStarted(readPendingToken());
+    const text = event.message;
+    if (typeof text === "string") await post({ type: "external_conversation_item", data: { item_type: "message", response_id, item_data: { role: "user", content: [{ type: "input_text", text }] } } });
+    await post({ type: "external_session_status", data: { status: "running", response_id } });
+  });
+  amp.on("agent.end", async (event: AmpEvent) => {
+    if (!managedThreadID || event.thread?.id !== managedThreadID) return;
+    const response_id = activeResponseID ?? responseID(event);
+    const text = (event.messages ?? []).filter((m) => m.role === "assistant").flatMap((m) => m.content ?? []).filter((b) => b.type === "text" && typeof b.text === "string").map((b) => b.text).join("\n");
+    if (text) await post({ type: "external_assistant_message", data: { agent: "Amp", text, response_id } });
+    const failed = Boolean(event.error) || event.status === "error";
+    await post({ type: "external_session_status", data: { status: failed ? "failed" : "idle", response_id } });
+    activeResponseID = undefined;
+  });
+}

@@ -37,6 +37,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
+    SessionResourceView,
     resolve_terminal_entry_by_resource_id,
     session_resource_view_to_dict,
     terminal_resource_id,
@@ -68,6 +69,7 @@ from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
     ResolvedSpec,
+    _agent_os_env_from_spec,
     _antigravity_native_terminal_arrives_via_transfer,
     _auto_create_antigravity_terminal,
     _auto_create_claude_terminal,
@@ -91,7 +93,6 @@ from omnigent.runner.native import (
     _codex_native_model_from_spec,
     _codex_session_needs_runner_terminal,
     _CodexNativeModelOptionsNotReady,
-    _delete_native_bridge_dirs,
     _ensure_orchestrator_skills_in_bundle,
     _forward_harness_response,
     _is_runner_owned_antigravity_terminal,
@@ -99,6 +100,7 @@ from omnigent.runner.native import (
     _is_spec_local_native_python_tool,
     _log_terminal_lookup_miss,
     _native_terminal_start_error_response,
+    _pi_native_launch_config,
     _publish_native_terminal_start_error,
     _publish_terminal_pending,
     _publish_tmux_target_for_bridge,
@@ -113,6 +115,7 @@ from omnigent.runner.native import (
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
+    AMP_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
@@ -130,7 +133,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleResponse,
 )
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
-from omnigent.spec.types import LocalToolInfo, SkillSpec
+from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_bridge import (
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -183,6 +186,127 @@ for _builder_name in (
     "_auto_create_repl_terminal",
 ):
     globals()[_builder_name] = _native_builder(_builder_name)
+
+
+async def _auto_create_amp_terminal(
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    publish_event: Callable[[str, dict[str, Any]], None],
+    *,
+    server_client: httpx.AsyncClient | None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
+    ensure_comment_relay: Callable[..., Awaitable[None]] | None = None,
+) -> SessionResourceView:
+    """Launch real interactive Amp with its process-scoped plugin config."""
+    from omnigent.amp_native import build_amp_launch
+    from omnigent.amp_native_bridge import (
+        AMP_NATIVE_CONFIG_ENV_VAR,
+        clear_inbox,
+        install_plugin_and_config,
+        prepare_bridge_dir,
+    )
+    from omnigent.cli_auth import databricks_request_headers
+    from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+    from omnigent.runner._entry import _make_auth_token_factory
+
+    launch_config = await _pi_native_launch_config(
+        session_id=session_id, server_client=server_client
+    )
+    server_url = launch_config.server_url
+    external_id = launch_config.external_session_id
+    if external_id is not None and (
+        not isinstance(external_id, str) or not external_id.startswith("T-")
+    ):
+        raise RuntimeError(f"Invalid Amp external_session_id for {session_id!r}")
+    token_factory = _make_auth_token_factory()
+    token = token_factory() if token_factory else None
+    bridge = prepare_bridge_dir(session_id)
+    clear_inbox(bridge)
+    _plugin, config = install_plugin_and_config(
+        bridge,
+        session_id=session_id,
+        server_url=server_url,
+        auth_headers=databricks_request_headers(server_url, bearer_token=token),
+    )
+    # Start the shared builtin-tool relay BEFORE Amp launches so
+    # ``tool_relay.json`` exists where the plugin reads it on load. The relay
+    # POSTs each call back through the Omnigent server (policy enforced); the
+    # plugin registers those schemas via ``amp.registerTool``.
+    if server_client is not None and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge,
+            await_notify=False,
+        )
+    argv = build_amp_launch(
+        launch_config.terminal_launch_args or [], external_session_id=external_id
+    )
+    agent_os_env = _agent_os_env_from_spec(agent_spec)
+    terminal_view = await resource_registry.launch_required_terminal(
+        session_id=session_id,
+        terminal_name="amp",
+        session_key="main",
+        resource_role=AMP_NATIVE_TERMINAL_ROLE,
+        parent_os_env=agent_os_env,
+        spec=TerminalEnvSpec(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(launch_config.workspace),
+                sandbox=(agent_os_env.sandbox if agent_os_env else None),
+            ),
+            command=argv[0],
+            args=argv[1:],
+            env={AMP_NATIVE_CONFIG_ENV_VAR: str(config)},
+            scrollback=100_000,
+            tmux_allow_passthrough=True,
+            tmux_start_on_attach=False,
+        ),
+    )
+    terminal_registry = resource_registry.terminal_registry
+    if terminal_registry is not None:
+        instance = terminal_registry.get(session_id, "amp", "main")
+        if instance is not None and instance.running:
+            from omnigent.cursor_native_bridge import write_tmux_target
+
+            write_tmux_target(
+                bridge,
+                socket_path=instance.socket_path,
+                tmux_target=instance.tmux_target,
+            )
+    publish_event(
+        session_id,
+        {
+            "type": "session.resource.created",
+            "resource": session_resource_view_to_dict(terminal_view),
+        },
+    )
+    return terminal_view
+
+
+async def _delete_native_bridge_dirs(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+) -> None:
+    """Remove native bridge state, including the Amp bridge directory."""
+    await _native._delete_native_bridge_dirs(
+        server_client=server_client,
+        session_id=session_id,
+    )
+    from omnigent.amp_native_bridge import bridge_dir_for_session_id
+
+    try:
+        import shutil
+
+        shutil.rmtree(bridge_dir_for_session_id(session_id))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _logger.debug(
+            "Failed to remove Amp bridge dir for session %s: %s",
+            session_id,
+            exc,
+        )
 
 
 async def _generate_claude_native_background_title(
@@ -1885,6 +2009,7 @@ def create_runner_app(
     _session_comment_relays: dict[str, Any] = {}
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _amp_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _kiro_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
@@ -2744,6 +2869,10 @@ def create_runner_app(
                 from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
                 spawn_env = build_pi_native_spawn_env(session_id)
+            if harness_name == "amp-native" and spawn_env is None:
+                from omnigent.amp_native_bridge import build_amp_native_spawn_env
+
+                spawn_env = build_amp_native_spawn_env(session_id)
             if harness_name == "opencode-native" and spawn_env is None:
                 from omnigent.opencode_native_bridge import (
                     OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -3043,6 +3172,39 @@ def create_runner_app(
                             _publish_event,
                             session_id,
                             "Pi",
+                            exc,
+                        )
+                    finally:
+                        _publish_terminal_pending(_publish_event, session_id, False)
+
+        if harness_name == "amp-native":
+            _amp_ensure_lock = _amp_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with _amp_ensure_lock:
+                _tr = resource_registry.terminal_registry
+                _has_amp_terminal = (
+                    _tr is not None and _tr.get(session_id, "amp", "main") is not None
+                )
+                if not _has_amp_terminal:
+                    _publish_terminal_pending(_publish_event, session_id, True)
+                    try:
+                        _amp_spec = await _resolve_session_agent_spec(session_id)
+                        await _auto_create_amp_terminal(
+                            session_id,
+                            resource_registry,
+                            _publish_event,
+                            server_client=server_client,
+                            agent_spec=_amp_spec,
+                            ensure_comment_relay=_ensure_comment_relay_started,
+                        )
+                    except Exception as exc:
+                        _logger.exception(
+                            "Failed to auto-create amp terminal for %s",
+                            session_id,
+                        )
+                        _publish_native_terminal_start_error(
+                            _publish_event,
+                            session_id,
+                            "Amp",
                             exc,
                         )
                     finally:
@@ -3597,6 +3759,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _amp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
@@ -4121,6 +4284,7 @@ def create_runner_app(
         if status != "failed" and harness in {
             "claude-native",
             "pi-native",
+            "amp-native",
             "cursor-native",
             "kiro-native",
             "goose-native",
@@ -4500,6 +4664,19 @@ def create_runner_app(
                 },
             )
         _wake_parent_after_native_interrupt(conv_id)
+        return Response(status_code=204)
+
+    async def _handle_amp_native_interrupt(conv_id: str) -> Response:
+        """Ask the resident Amp plugin to cancel its active thread."""
+        from omnigent.amp_native_bridge import bridge_dir_for_session_id, enqueue_interrupt
+
+        try:
+            await asyncio.to_thread(enqueue_interrupt, bridge_dir_for_session_id(conv_id))
+        except OSError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "amp_native_interrupt_failed", "detail": str(exc)},
+            )
         return Response(status_code=204)
 
     async def _handle_pi_native_model_change(
@@ -6258,6 +6435,10 @@ def create_runner_app(
             from omnigent.pi_native_bridge import build_pi_native_spawn_env
 
             spawn_env = build_pi_native_spawn_env(conv_id)
+        if harness_name == "amp-native" and spawn_env is None:
+            from omnigent.amp_native_bridge import build_amp_native_spawn_env
+
+            spawn_env = build_amp_native_spawn_env(conv_id)
         if harness_name == "opencode-native" and spawn_env is None:
             from omnigent.opencode_native_bridge import (
                 OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -6999,6 +7180,8 @@ def create_runner_app(
                 return await _handle_codex_native_interrupt(conversation_id)
             if _harness == "pi-native":
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "amp-native":
+                return await _handle_amp_native_interrupt(conversation_id)
             if _harness == "cursor-native":
                 return await _handle_cursor_native_interrupt(conversation_id)
             if _harness == "goose-native":
@@ -7063,6 +7246,8 @@ def create_runner_app(
                 return await _handle_codex_native_interrupt(conversation_id)
             if _harness == "pi-native":
                 return await _handle_pi_native_interrupt(conversation_id)
+            if _harness == "amp-native":
+                return await _handle_amp_native_interrupt(conversation_id)
             if _harness == "cursor-native":
                 return await _handle_cursor_native_stop(conversation_id)
             if _harness == "goose-native":
@@ -7589,6 +7774,39 @@ def create_runner_app(
                         session_id,
                     )
                     return _native_terminal_start_error_response(exc, "Pi")
+            return JSONResponse(
+                status_code=200,
+                content=session_resource_view_to_dict(terminal_view),
+            )
+
+        if body.get("ensure_native_terminal") and terminal_name == "amp" and session_key == "main":
+            amp_terminal_id = terminal_resource_id("amp", "main")
+            ensure_lock = _amp_terminal_ensure_locks.setdefault(session_id, asyncio.Lock())
+            async with ensure_lock:
+                existing = await resource_registry.get_terminal_resource(
+                    session_id, amp_terminal_id
+                )
+                if existing is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content=session_resource_view_to_dict(existing),
+                    )
+                try:
+                    amp_agent_spec = await _resolve_session_agent_spec(session_id)
+                    terminal_view = await _auto_create_amp_terminal(
+                        session_id,
+                        resource_registry,
+                        _publish_event,
+                        server_client=server_client,
+                        agent_spec=amp_agent_spec,
+                        ensure_comment_relay=_ensure_comment_relay_started,
+                    )
+                except Exception as exc:
+                    _logger.exception(
+                        "Amp terminal ensure failed for session=%s",
+                        session_id,
+                    )
+                    return _native_terminal_start_error_response(exc, "Amp")
             return JSONResponse(
                 status_code=200,
                 content=session_resource_view_to_dict(terminal_view),
@@ -9140,6 +9358,7 @@ def create_runner_app(
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
+        _amp_terminal_ensure_locks.pop(session_id, None)
         _cursor_terminal_ensure_locks.pop(session_id, None)
         _kiro_terminal_ensure_locks.pop(session_id, None)
         _antigravity_terminal_ensure_locks.pop(session_id, None)
