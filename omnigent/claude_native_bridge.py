@@ -245,6 +245,22 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
             trusted_parent = antigravity_root.parent.parent
         return _absolute_syntactic_path(trusted_parent)
 
+    from omnigent.amp_native_bridge import bridge_root as amp_bridge_root
+
+    # amp-native keeps its bridge files below ``~/.omnigent/amp-native``, the same
+    # ``$HOME/.omnigent/<harness>-native`` shape codex/antigravity/opencode use, so
+    # apply the identical anchor logic: in production trust ``$HOME`` and
+    # validate/chmod the two bridge-owned dirs below it (``.omnigent`` and
+    # ``amp-native``); in tests the monkeypatched root may differ, so trust the
+    # direct parent. Without this the shared relay refuses to write
+    # ``tool_relay.json`` into the amp bridge dir and Amp registers no relay tools.
+    amp_root = _absolute_syntactic_path(amp_bridge_root())
+    if target.is_relative_to(amp_root):
+        trusted_parent = amp_root.parent
+        if amp_root.name == "amp-native" and amp_root.parent.name == ".omnigent":
+            trusted_parent = amp_root.parent.parent
+        return _absolute_syntactic_path(trusted_parent)
+
     from omnigent.qwen_native_bridge import bridge_root as qwen_bridge_root
 
     qwen_root = _absolute_syntactic_path(qwen_bridge_root())
@@ -295,8 +311,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s})"
+        f"{antigravity_root!s}, {amp_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{opencode_root!s}, {kiro_root!s}, {acp_root!s})"
     )
 
 
